@@ -27,6 +27,7 @@ import (
 	"istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/api/type/v1beta1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
@@ -1997,6 +1998,9 @@ func TestCreateSidecarScope(t *testing.T) {
 
 			sidecarConfig := tt.sidecarConfig
 			sidecarScope := ConvertToSidecarScope(ps, sidecarConfig, "mynamespace")
+			if features.EnableLazySidecarEvaluation && sidecarScope.initFunc != nil {
+				sidecarScope.initFunc()
+			}
 			configuredListeneres := 1
 			if sidecarConfig != nil {
 				r := sidecarConfig.Spec.(*networking.Sidecar)
@@ -2312,6 +2316,9 @@ func TestContainsEgressDependencies(t *testing.T) {
 			ps.virtualServiceIndex.publicByGateway[constants.IstioMeshGateway] = append(ps.virtualServiceIndex.publicByGateway[constants.IstioMeshGateway], virtualServices...)
 			ps.setDestinationRules(destinationRules)
 			sidecarScope := ConvertToSidecarScope(ps, cfg, "default")
+			if features.EnableLazySidecarEvaluation && sidecarScope.initFunc != nil {
+				sidecarScope.initFunc()
+			}
 			if len(tt.egress) == 0 {
 				sidecarScope = DefaultSidecarScopeForNamespace(ps, "default")
 			}
@@ -2371,6 +2378,9 @@ func TestRootNsSidecarDependencies(t *testing.T) {
 			meshConfig := mesh.DefaultMeshConfig()
 			ps.Mesh = meshConfig
 			sidecarScope := ConvertToSidecarScope(ps, cfg, "default")
+			if features.EnableLazySidecarEvaluation && sidecarScope.initFunc != nil {
+				sidecarScope.initFunc()
+			}
 			if len(tt.egress) == 0 {
 				sidecarScope = DefaultSidecarScopeForNamespace(ps, "default")
 			}
@@ -2505,6 +2515,10 @@ outboundTrafficPolicy:
 				sidecarScope = DefaultSidecarScopeForNamespace(ps, "not-default")
 			} else {
 				sidecarScope = ConvertToSidecarScope(ps, test.sidecar, test.sidecar.Namespace)
+			}
+
+			if features.EnableLazySidecarEvaluation && sidecarScope.initFunc != nil {
+				sidecarScope.initFunc()
 			}
 
 			if !reflect.DeepEqual(test.outboundTrafficPolicy, sidecarScope.OutboundTrafficPolicy) {
