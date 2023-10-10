@@ -687,7 +687,7 @@ var (
 		"If true, pilot will configure an additional IPv4 listener for outbound traffic in IPv6 only clusters, e.g. AWS EKS IPv6 only clusters.").Get()
 
 	EnableLazySidecarEvaluation = env.Register("ENABLE_LAZY_SIDECAR_EVALUATION", true,
-		"If enabled, pilot will only evaluate sidecar resources when actually used").Get()
+		"If enabled, pilot will only compute sidecar resources when actually used").Get()
 )
 
 // UnsafeFeaturesEnabled returns true if any unsafe features are enabled.
