@@ -262,6 +262,8 @@ func DefaultSidecarScopeForNamespace(ps *PushContext, configNamespace string) *S
 		}
 	}
 
+	out.initFunc = func() {}
+
 	return out
 }
 
@@ -287,12 +289,12 @@ func ConvertToSidecarScope(ps *PushContext, sidecarConfig *config.Config, config
 		Namespace: sidecarConfig.Namespace,
 	}.HashCode())
 
-	if !features.EnableLazySidecarEvaluation {
+	out.initFunc = sync.OnceFunc(func() {
 		initSidecarScopeInternalIndexes(ps, out, configNamespace)
-	} else {
-		out.initFunc = sync.OnceFunc(func() {
-			initSidecarScopeInternalIndexes(ps, out, configNamespace)
-		})
+	})
+
+	if !features.EnableLazySidecarEvaluation {
+		out.initFunc()
 	}
 
 	return out

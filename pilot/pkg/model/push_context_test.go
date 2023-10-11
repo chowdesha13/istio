@@ -1533,9 +1533,7 @@ func TestInitPushContext(t *testing.T) {
 
 	for _, sidecars := range old.sidecarIndex.sidecarsByNamespace {
 		for _, sidecar := range sidecars {
-			if sidecar.initFunc != nil {
-				sidecar.initFunc()
-			}
+			sidecar.initFunc()
 		}
 	}
 
@@ -1552,9 +1550,7 @@ func TestInitPushContext(t *testing.T) {
 
 	for _, sidecars := range newPush.sidecarIndex.sidecarsByNamespace {
 		for _, sidecar := range sidecars {
-			if sidecar.initFunc != nil {
-				sidecar.initFunc()
-			}
+			sidecar.initFunc()
 		}
 	}
 
