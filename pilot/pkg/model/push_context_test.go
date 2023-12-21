@@ -40,6 +40,7 @@ import (
 	selectorpb "istio.io/api/type/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
@@ -2145,7 +2146,7 @@ func TestSetDestinationRuleWithExportTo(t *testing.T) {
 		},
 		Spec: &networking.DestinationRule{
 			Host:     testhost,
-			ExportTo: []string{"test2", "ns1", "test1"},
+			ExportTo: []string{"test2", "ns1", "test1", "newNS"},
 			Subsets: []*networking.Subset{
 				{
 					Name: "subset3",
@@ -2329,6 +2330,12 @@ func TestSetDestinationRuleWithExportTo(t *testing.T) {
 		{
 			proxyNs:     "test2",
 			serviceNs:   "test1",
+			host:        testhost,
+			wantSubsets: []string{"subset3", "subset4"},
+		},
+		{
+			proxyNs:     "newNS",
+			serviceNs:   "test2",
 			host:        testhost,
 			wantSubsets: []string{"subset3", "subset4"},
 		},
@@ -2810,34 +2817,50 @@ func TestServiceWithExportTo(t *testing.T) {
 	svc4 := &Service{
 		Hostname: "svc4",
 		Attributes: ServiceAttributes{
-			Namespace: "test4",
+			Namespace:       "test4",
+			ServiceRegistry: provider.External,
+		},
+	}
+	svc4_1 := &Service{
+		Hostname: "svc4",
+		Attributes: ServiceAttributes{
+			Namespace:       "test4",
+			ServiceRegistry: provider.External,
+		},
+	}
+	// kubernetes service will override non kubernetes
+	svc4_2 := &Service{
+		Hostname: "svc4",
+		Attributes: ServiceAttributes{
+			Namespace:       "test4",
+			ServiceRegistry: provider.Kubernetes,
 		},
 	}
 	env.ServiceDiscovery = &localServiceDiscovery{
-		services: []*Service{svc1, svc2, svc3, svc4},
+		services: []*Service{svc1, svc2, svc3, svc4, svc4_1, svc4_2},
 	}
 	ps.initDefaultExportMaps()
-	ps.initServiceRegistry(env)
-
+	ps.initServiceRegistry(env, nil)
+	assert.Equal(t, ps.ServiceIndex.HostnameAndNamespace[svc4.Hostname][svc4.Attributes.Namespace].Attributes.ServiceRegistry, provider.Kubernetes)
 	cases := []struct {
 		proxyNs   string
 		wantHosts []string
 	}{
 		{
 			proxyNs:   "test1",
-			wantHosts: []string{"svc1", "svc2", "svc3", "svc4"},
+			wantHosts: []string{"svc1", "svc2", "svc3", "svc4", "svc4", "svc4"},
 		},
 		{
 			proxyNs:   "test2",
-			wantHosts: []string{"svc2", "svc3", "svc4"},
+			wantHosts: []string{"svc2", "svc3", "svc4", "svc4", "svc4"},
 		},
 		{
 			proxyNs:   "ns1",
-			wantHosts: []string{"svc1", "svc2", "svc3", "svc4"},
+			wantHosts: []string{"svc1", "svc2", "svc3", "svc4", "svc4", "svc4"},
 		},
 		{
 			proxyNs:   "random",
-			wantHosts: []string{"svc3", "svc4"},
+			wantHosts: []string{"svc3", "svc4", "svc4", "svc4"},
 		},
 	}
 	for _, tt := range cases {
@@ -2934,8 +2957,8 @@ func TestGetHostsFromMeshConfig(t *testing.T) {
 	ps.initTelemetry(env)
 	ps.initDefaultExportMaps()
 	ps.initVirtualServices(env)
-	got := ps.virtualServiceIndex.destinationsByGateway[gatewayName]
-	assert.Equal(t, []string{"otel.foo.svc.cluster.local"}, sets.SortedList(got))
+	assert.Equal(t, ps.virtualServiceIndex.destinationsByGateway[gatewayName], sets.String{})
+	assert.Equal(t, ps.extraGatewayServices(nil), sets.New("otel.foo.svc.cluster.local"))
 }
 
 func TestWellKnownProvidersCount(t *testing.T) {
@@ -3023,4 +3046,161 @@ func (l *localServiceDiscovery) NetworkGateways() []NetworkGateway {
 
 func (l *localServiceDiscovery) MCSServices() []MCSServiceInfo {
 	return nil
+}
+
+func TestResolveServiceAliases(t *testing.T) {
+	type service struct {
+		Name         host.Name
+		Aliases      host.Names
+		ExternalName string
+	}
+	tests := []struct {
+		name   string
+		input  []service
+		output []service
+	}{
+		{
+			name:   "no aliases",
+			input:  []service{{Name: "test"}},
+			output: []service{{Name: "test"}},
+		},
+		{
+			name: "simple alias",
+			input: []service{
+				{Name: "concrete"},
+				{Name: "alias", ExternalName: "concrete"},
+			},
+			output: []service{
+				{Name: "concrete", Aliases: host.Names{"alias"}},
+				{Name: "alias", ExternalName: "concrete"},
+			},
+		},
+		{
+			name: "multiple alias",
+			input: []service{
+				{Name: "concrete"},
+				{Name: "alias1", ExternalName: "concrete"},
+				{Name: "alias2", ExternalName: "concrete"},
+			},
+			output: []service{
+				{Name: "concrete", Aliases: host.Names{"alias1", "alias2"}},
+				{Name: "alias1", ExternalName: "concrete"},
+				{Name: "alias2", ExternalName: "concrete"},
+			},
+		},
+		{
+			name: "chained alias",
+			input: []service{
+				{Name: "concrete"},
+				{Name: "alias1", ExternalName: "alias2"},
+				{Name: "alias2", ExternalName: "concrete"},
+			},
+			output: []service{
+				{Name: "concrete", Aliases: host.Names{"alias1", "alias2"}},
+				{Name: "alias1", ExternalName: "alias2"},
+				{Name: "alias2", ExternalName: "concrete"},
+			},
+		},
+		{
+			name: "looping alias",
+			input: []service{
+				{Name: "alias1", ExternalName: "alias2"},
+				{Name: "alias2", ExternalName: "alias1"},
+			},
+			output: []service{
+				{Name: "alias1", ExternalName: "alias2"},
+				{Name: "alias2", ExternalName: "alias1"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inps := slices.Map(tt.input, func(e service) *Service {
+				resolution := ClientSideLB
+				if e.ExternalName != "" {
+					resolution = Alias
+				}
+				return &Service{
+					Resolution: resolution,
+					Attributes: ServiceAttributes{
+						K8sAttributes: K8sAttributes{ExternalName: e.ExternalName},
+					},
+					Hostname: e.Name,
+				}
+			})
+			resolveServiceAliases(inps, nil)
+			out := slices.Map(inps, func(e *Service) service {
+				return service{
+					Name: e.Hostname,
+					Aliases: slices.Map(e.Attributes.Aliases, func(e NamespacedHostname) host.Name {
+						return e.Hostname
+					}),
+					ExternalName: e.Attributes.K8sAttributes.ExternalName,
+				}
+			})
+			assert.Equal(t, tt.output, out)
+		})
+	}
+}
+
+func BenchmarkInitServiceAccounts(b *testing.B) {
+	ps := NewPushContext()
+	index := NewEndpointIndex(DisabledCache{})
+	env := &Environment{EndpointIndex: index}
+	ps.Mesh = &meshconfig.MeshConfig{TrustDomainAliases: []string{"td1", "td2"}}
+
+	services := []*Service{
+		{
+			Hostname: "svc-unset",
+			Ports:    allPorts,
+			Attributes: ServiceAttributes{
+				Namespace: "test1",
+			},
+		},
+		{
+			Hostname: "svc-public",
+			Ports:    allPorts,
+			Attributes: ServiceAttributes{
+				Namespace: "test1",
+				ExportTo:  sets.New(visibility.Public),
+			},
+		},
+		{
+			Hostname: "svc-private",
+			Ports:    allPorts,
+			Attributes: ServiceAttributes{
+				Namespace: "test1",
+				ExportTo:  sets.New(visibility.Private),
+			},
+		},
+		{
+			Hostname: "svc-none",
+			Ports:    allPorts,
+			Attributes: ServiceAttributes{
+				Namespace: "test1",
+				ExportTo:  sets.New(visibility.None),
+			},
+		},
+		{
+			Hostname: "svc-namespace",
+			Ports:    allPorts,
+			Attributes: ServiceAttributes{
+				Namespace: "test1",
+				ExportTo:  sets.New(visibility.Instance("namespace")),
+			},
+		},
+	}
+
+	for _, svc := range services {
+		if index.shardsBySvc[string(svc.Hostname)] == nil {
+			index.shardsBySvc[string(svc.Hostname)] = map[string]*EndpointShards{}
+		}
+		index.shardsBySvc[string(svc.Hostname)][svc.Attributes.Namespace] = &EndpointShards{
+			ServiceAccounts: sets.New("spiffe://cluster.local/ns/def/sa/sa1", "spiffe://cluster.local/ns/def/sa/sa2"),
+		}
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		ps.initServiceAccounts(env, services)
+	}
 }

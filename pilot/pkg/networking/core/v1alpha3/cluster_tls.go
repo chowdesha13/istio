@@ -86,7 +86,11 @@ var hboneOrPlaintextSocket = []*cluster.Cluster_TransportSocketMatch{
 }
 
 // applyUpstreamTLSSettings applies upstream tls context to the cluster
-func (cb *ClusterBuilder) applyUpstreamTLSSettings(opts *buildClusterOpts, tls *networking.ClientTLSSettings, mtlsCtxType mtlsContextType) {
+func (cb *ClusterBuilder) applyUpstreamTLSSettings(
+	opts *buildClusterOpts,
+	tls *networking.ClientTLSSettings,
+	mtlsCtxType mtlsContextType,
+) {
 	c := opts.mutable
 	tlsContext, err := cb.buildUpstreamClusterTLSContext(opts, tls)
 	if err != nil {
@@ -168,14 +172,14 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 		// The code has repeated snippets because We want to use predefined alpn strings for efficiency.
 		if cb.isHttp2Cluster(c) {
 			// This is HTTP/2 in-mesh cluster, advertise it with ALPN.
-			if features.MetadataExchange {
+			if features.MetadataExchange && !features.DisableMxALPN {
 				tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNInMeshH2WithMxc
 			} else {
 				tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNInMeshH2
 			}
 		} else {
 			// This is in-mesh cluster, advertise it with ALPN.
-			if features.MetadataExchange {
+			if features.MetadataExchange && !features.DisableMxALPN {
 				tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNInMeshWithMxc
 			} else {
 				tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNInMesh
@@ -308,7 +312,7 @@ func (cb *ClusterBuilder) setAutoSniAndAutoSanValidation(mc *clusterWrapper, tls
 	if len(tls.Sni) == 0 {
 		setAutoSni = true
 	}
-	if features.VerifyCertAtClient && len(tls.SubjectAltNames) == 0 && !tls.GetInsecureSkipVerify().GetValue() {
+	if features.VerifyCertAtClient && setAutoSni && len(tls.SubjectAltNames) == 0 && !tls.GetInsecureSkipVerify().GetValue() {
 		setAutoSanValidation = true
 	}
 

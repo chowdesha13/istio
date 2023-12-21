@@ -15,6 +15,7 @@
 package features
 
 import (
+	"runtime"
 	"strings"
 	"time"
 
@@ -58,17 +59,43 @@ var (
 		return f
 	}()
 
-	PushThrottle = env.Register(
-		"PILOT_PUSH_THROTTLE",
-		100,
-		"Limits the number of concurrent pushes allowed. On larger machines this can be increased for faster pushes",
-	).Get()
+	PushThrottle = func() int {
+		v := env.Register(
+			"PILOT_PUSH_THROTTLE",
+			0,
+			"Limits the number of concurrent pushes allowed. On larger machines this can be increased for faster pushes. "+
+				"If set to 0 or unset, the max will be automatically determined based on the machine size",
+		).Get()
+		if v > 0 {
+			return v
+		}
+		procs := runtime.GOMAXPROCS(0)
+		// Heuristic to scale with cores. We end up with...
+		// 1: 20
+		// 2: 25
+		// 4: 35
+		// 32: 100
+		return min(15+5*procs, 100)
+	}()
 
-	RequestLimit = env.Register(
-		"PILOT_MAX_REQUESTS_PER_SECOND",
-		25.0,
-		"Limits the number of incoming XDS requests per second. On larger machines this can be increased to handle more proxies concurrently.",
-	).Get()
+	RequestLimit = func() float64 {
+		v := env.Register(
+			"PILOT_MAX_REQUESTS_PER_SECOND",
+			0.0,
+			"Limits the number of incoming XDS requests per second. On larger machines this can be increased to handle more proxies concurrently. "+
+				"If set to 0 or unset, the max will be automatically determined based on the machine size",
+		).Get()
+		if v > 0 {
+			return v
+		}
+		procs := runtime.GOMAXPROCS(0)
+		// Heuristic to scale with cores. We end up with...
+		// 1: 20
+		// 2: 25
+		// 4: 35
+		// 32: 100
+		return min(float64(15+5*procs), 100.0)
+	}()
 
 	// FilterGatewayClusterConfig controls if a subset of clusters(only those required) should be pushed to gateways
 	FilterGatewayClusterConfig = env.Register("PILOT_FILTER_GATEWAY_CLUSTER_CONFIG", false,
@@ -225,7 +252,7 @@ var (
 		"The group to be used for the Kubernetes Multi-Cluster Services (MCS) API.").Get()
 
 	MCSAPIVersion = env.Register("MCS_API_VERSION", "v1alpha1",
-		"The version to be used for the Kubernets Multi-Cluster Services (MCS) API.").Get()
+		"The version to be used for the Kubernetes Multi-Cluster Services (MCS) API.").Get()
 
 	EnableMCSAutoExport = env.Register(
 		"ENABLE_MCS_AUTO_EXPORT",
@@ -485,6 +512,10 @@ var (
 		"If true, pilot will add metadata exchange filters, which will be consumed by telemetry filter.",
 	).Get()
 
+	DisableMxALPN = env.Register("PILOT_DISABLE_MX_ALPN", false,
+		"If true, pilot will not put istio-peer-exchange ALPN into TLS handshake configuration.",
+	).Get()
+
 	ALPNFilter = env.Register("PILOT_ENABLE_ALPN_FILTER", true,
 		"If true, pilot will add Istio ALPN filters, required for proper protocol sniffing.",
 	).Get()
@@ -650,6 +681,14 @@ var (
 	EnableNativeSidecars = env.Register("ENABLE_NATIVE_SIDECARS", false,
 		"If set, used Kubernetes native Sidecar container support. Requires SidecarContainer feature flag.")
 
+	EnableExternalNameAlias = env.Register("ENABLE_EXTERNAL_NAME_ALIAS", true,
+		"If enabled, ExternalName Services will be treated as simple aliases: anywhere where we would match the concrete service, "+
+			"we also match the ExternalName. In general, this mirrors Kubernetes behavior more closely. However, it means that policies (routes and DestinationRule) "+
+			"cannot be applied to the ExternalName service. "+
+			"If disabled, ExternalName behaves in fairly unexpected manner. Port matters, while it does not in Kubernetes. If it is a TCP port, "+
+			"all traffic on that port will be matched, which can have disastrous consequences. Additionally, the destination is seen as an opaque destination; "+
+			"even if it is another service in the mesh, policies such as mTLS and load balancing will not be used when connecting to it.").Get()
+
 	// This is an experimental feature flag, can be removed once it became stable, and should introduced to Telemetry API.
 	MetricRotationInterval = env.Register("METRIC_ROTATION_INTERVAL", 0*time.Second,
 		"Metric scope rotation interval, set to 0 to disable the metric scope rotation").Get()
@@ -674,8 +713,8 @@ var (
 		"If enabled, istiod will skip verifying the certificate of the JWKS server.").Get()
 
 	// User should not rely on builtin resource labels, this flag will be removed in future releases(1.20).
-	EnableOTELBuiltinResourceLables = env.Register("ENABLE_OTEL_BUILTIN_RESOURCE_LABELS", false,
-		"If enabled, envoy will send builtin lables(e.g. node_name) via OTel sink.").Get()
+	EnableOTELBuiltinResourceLabels = env.Register("ENABLE_OTEL_BUILTIN_RESOURCE_LABELS", false,
+		"If enabled, envoy will send builtin labels(e.g. node_name) via OTel sink.").Get()
 
 	EnableSelectorBasedK8sGatewayPolicy = env.Register("ENABLE_SELECTOR_BASED_K8S_GATEWAY_POLICY", true,
 		"If disabled, Gateway API gateways will ignore workloadSelector policies, only"+
@@ -685,6 +724,17 @@ var (
 	// Also see https://github.com/istio/istio/issues/46719 why this flag is required
 	EnableAdditionalIpv4OutboundListenerForIpv6Only = env.RegisterBoolVar("ISTIO_ENABLE_IPV4_OUTBOUND_LISTENER_FOR_IPV6_CLUSTERS", false,
 		"If true, pilot will configure an additional IPv4 listener for outbound traffic in IPv6 only clusters, e.g. AWS EKS IPv6 only clusters.").Get()
+
+	UseCacertsForSelfSignedCA = env.Register("USE_CACERTS_FOR_SELF_SIGNED_CA", false,
+		"If enabled, istiod will use a secret named cacerts to store its self-signed istio-"+
+			"generated root certificate.").Get()
+
+	StackdriverAuditLog = env.Register("STACKDRIVER_AUDIT_LOG", false, ""+
+		"If enabled, StackDriver audit logging will be enabled.").Get()
+
+	PersistOldestWinsHeuristicForVirtualServiceHostMatching = env.Register("PERSIST_OLDEST_FIRST_HEURISTIC_FOR_VIRTUAL_SERVICE_HOST_MATCHING", false,
+		"If enabled, istiod will persist the oldest first heuristic for subtly conflicting traffic policy selection"+
+			"(such as with overlapping wildcard hosts)").Get()
 
 	EnableLazySidecarEvaluation = env.Register("ENABLE_LAZY_SIDECAR_EVALUATION", true,
 		"If enabled, pilot will only compute sidecar resources when actually used").Get()

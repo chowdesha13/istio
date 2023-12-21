@@ -17,14 +17,12 @@ package dependencies
 import (
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 
 	utilversion "k8s.io/apimachinery/pkg/util/version"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
@@ -87,13 +85,6 @@ type IptablesVersion struct {
 	legacy bool
 }
 
-// NoLocks returns true if this version does not use or support locks
-func (v IptablesVersion) NoLocks() bool {
-	// nf_tables does not use locks
-	// legacy added locks in 1.6.2
-	return !v.legacy || v.version.LessThan(IptablesRestoreLocking)
-}
-
 func DetectIptablesVersion(ver string) (IptablesVersion, error) {
 	if ver == "" {
 		var err error
@@ -143,20 +134,6 @@ func transformToXTablesErrorMessage(stderr string, err error) string {
 	}
 
 	return stderr
-}
-
-// RunOrFail runs a command and exits with an error message, if it fails
-func (r *RealDependencies) RunOrFail(cmd string, stdin io.ReadSeeker, args ...string) {
-	var err error
-	if XTablesCmds.Contains(cmd) {
-		err = r.executeXTables(cmd, false, stdin, args...)
-	} else {
-		err = r.execute(cmd, false, stdin, args...)
-	}
-	if err != nil {
-		log.Errorf("Failed to execute: %s %s, %v", cmd, strings.Join(args, " "), err)
-		os.Exit(-1)
-	}
 }
 
 // Run runs a command

@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
 
+	"istio.io/api/networking/v1alpha3"
 	"istio.io/api/security/v1beta1"
 	apiv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
@@ -452,7 +453,7 @@ func (c *Controller) PeerAuthenticationHandler(old config.Config, obj config.Con
 		}
 	}
 
-	updates := c.ambientIndex.CalculateUpdatedWorkloads(pods, workloadEntries, c)
+	updates := c.ambientIndex.CalculateUpdatedWorkloads(pods, workloadEntries, nil, c)
 
 	if len(updates) > 0 {
 		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
@@ -467,35 +468,32 @@ func (c *Controller) PeerAuthenticationHandler(old config.Config, obj config.Con
 //
 // NOTE: As an interface method of AmbientIndex, this locks the index.
 func (a *AmbientIndexImpl) CalculateUpdatedWorkloads(pods map[string]*v1.Pod,
-	workloadEntries map[networkAddress]*apiv1alpha3.WorkloadEntry, c *Controller,
+	workloadEntries map[networkAddress]*apiv1alpha3.WorkloadEntry, seEndpoints map[*apiv1alpha3.ServiceEntry]sets.Set[*v1alpha3.WorkloadEntry], c *Controller,
 ) map[model.ConfigKey]struct{} {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	updates := map[model.ConfigKey]struct{}{}
 	for _, pod := range pods {
+		uid := c.generatePodUID(pod)
+		oldWl := a.byUID[uid]
 		newWl := a.extractWorkload(pod, c)
-		if newWl != nil {
-			// Update the pod, since it now has new VIP info
-			networkAddrs := networkAddressFromWorkload(newWl)
-			for _, networkAddr := range networkAddrs {
-				a.byPod[networkAddr] = newWl
-			}
-			a.byUID[c.generatePodUID(pod)] = newWl
-			updates[model.ConfigKey{Kind: kind.Address, Name: newWl.ResourceName()}] = struct{}{}
-		}
+		a.updateWorkloadIndexes(oldWl, newWl, updates)
 	}
 
 	for _, w := range workloadEntries {
+		uid := c.generateWorkloadEntryUID(w.Namespace, w.Name)
+		oldWl := a.byUID[uid]
 		newWl := a.extractWorkloadEntry(w, c)
-		if newWl != nil {
-			// Update the WorkloadEntry, since it now has new VIP info
-			networkAddrs := networkAddressFromWorkload(newWl)
-			for _, networkAddr := range networkAddrs {
-				a.byWorkloadEntry[networkAddr] = newWl
-			}
-			a.byUID[c.generateWorkloadEntryUID(w.GetNamespace(), w.GetName())] = newWl
-			updates[model.ConfigKey{Kind: kind.Address, Name: newWl.ResourceName()}] = struct{}{}
+		a.updateWorkloadIndexes(oldWl, newWl, updates)
+	}
+
+	for svcEntry, weSet := range seEndpoints {
+		for we := range weSet {
+			uid := c.generateServiceEntryUID(svcEntry.Namespace, svcEntry.Name, we.Address)
+			newWl := a.extractWorkloadEntrySpec(we, svcEntry.GetNamespace(), svcEntry.GetName(), svcEntry, c)
+			oldWl := a.byUID[uid]
+			a.updateWorkloadIndexes(oldWl, newWl, updates)
 		}
 	}
 
@@ -566,7 +564,20 @@ func (c *Controller) AuthorizationPolicyHandler(old config.Config, obj config.Co
 		}
 	}
 
-	updates := c.ambientIndex.CalculateUpdatedWorkloads(pods, workloadEntries, c)
+	// 3. only process service entries in config cluster with endpoints
+	seEndpoints := map[*apiv1alpha3.ServiceEntry]sets.Set[*v1alpha3.WorkloadEntry]{}
+	if c.configCluster {
+		for se, we := range c.getServiceEntryEndpointsInPolicy(obj.Namespace, sel) {
+			seEndpoints[se] = we
+		}
+		if oldSel != nil {
+			for se, we := range c.getServiceEntryEndpointsInPolicy(obj.Namespace, oldSel) {
+				seEndpoints[se] = we
+			}
+		}
+	}
+
+	updates := c.ambientIndex.CalculateUpdatedWorkloads(pods, workloadEntries, seEndpoints, c)
 
 	if len(updates) > 0 {
 		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{

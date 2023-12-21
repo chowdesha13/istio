@@ -43,7 +43,6 @@ import (
 	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
-	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/gateway"
 	"istio.io/istio/pkg/config/host"
@@ -254,7 +253,6 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 			proxyConfig, istionetworking.ListenerProtocolTCP, builder.push)
 		// In HTTP, we need to have RBAC, etc. upfront so that they can enforce policies immediately
 		httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_AUTHN)
-		httpFilterChainOpts.networkFilters = append(httpFilterChainOpts.networkFilters, xdsfilters.IstioNetworkAuthenticationFilter)
 		httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_AUTHZ)
 		httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_STATS)
 		httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
@@ -273,7 +271,6 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 					routeName, proxyConfig, istionetworking.TransportProtocolTCP, builder.push)
 				// In HTTP, we need to have RBAC, etc. upfront so that they can enforce policies immediately
 				httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_AUTHN)
-				httpFilterChainOpts.networkFilters = append(httpFilterChainOpts.networkFilters, xdsfilters.IstioNetworkAuthenticationFilter)
 				httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_AUTHZ)
 				httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_STATS)
 				httpFilterChainOpts.networkFilters = extension.PopAppendNetwork(httpFilterChainOpts.networkFilters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
@@ -461,14 +458,6 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 				}
 				gatewayRoutes[gatewayName][vskey] = routes
 			}
-			// This is the service that is exposed on gateway using VirtualService.
-			var gatewayService *model.Service
-			for _, hostname := range intersectingHosts {
-				if svc, exists := nameToServiceMap[hostname]; exists {
-					gatewayService = svc
-				}
-			}
-
 			for _, hostname := range intersectingHosts {
 				if vHost, exists := vHostDedupMap[hostname]; exists {
 					vHost.Routes = append(vHost.Routes, routes...)
@@ -476,6 +465,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 						vHost.RequireTls = route.VirtualHost_ALL
 					}
 				} else {
+					gatewayService := nameToServiceMap[hostname]
 					perRouteFilters := map[string]*anypb.Any{}
 					if gatewayService != nil {
 						// Build StatefulSession Filter if gateway service has persistence session label.
@@ -709,18 +699,25 @@ func buildGatewayConnectionManager(proxyConfig *meshconfig.ProxyConfig, node *mo
 	httpConnManager := &hcm.HttpConnectionManager{
 		XffNumTrustedHops: xffNumTrustedHops,
 		// Forward client cert if connection is mTLS
-		ForwardClientCertDetails: forwardClientCertDetails,
-		SetCurrentClientCertDetails: &hcm.HttpConnectionManager_SetCurrentClientCertDetails{
-			Subject: proto.BoolTrue,
-			Cert:    true,
-			Uri:     true,
-			Dns:     true,
-		},
+		ForwardClientCertDetails:   forwardClientCertDetails,
 		ServerName:                 ph.ServerName,
 		ServerHeaderTransformation: ph.ServerHeaderTransformation,
 		GenerateRequestId:          ph.GenerateRequestID,
 		HttpProtocolOptions:        httpProtoOpts,
 	}
+
+	// Only set_current_client_cert_details if forward_client_cert_details permitted
+	// See: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto
+	if forwardClientCertDetails == hcm.HttpConnectionManager_APPEND_FORWARD ||
+		forwardClientCertDetails == hcm.HttpConnectionManager_SANITIZE_SET {
+		httpConnManager.SetCurrentClientCertDetails = &hcm.HttpConnectionManager_SetCurrentClientCertDetails{
+			Subject: proto.BoolTrue,
+			Cert:    true,
+			Dns:     true,
+			Uri:     true,
+		}
+	}
+
 	if http3SupportEnabled {
 		httpConnManager.Http3ProtocolOptions = &core.Http3ProtocolOptions{}
 		httpConnManager.CodecType = hcm.HttpConnectionManager_HTTP3

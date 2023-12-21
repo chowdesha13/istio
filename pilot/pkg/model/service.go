@@ -145,6 +145,8 @@ const (
 	Passthrough
 	// DNSRoundRobinLB implies that the proxy will resolve a DNS address and forward to the resolved address
 	DNSRoundRobinLB
+	// Alias defines a Service that is an alias for another.
+	Alias
 )
 
 // String converts Resolution in to String.
@@ -679,6 +681,11 @@ type ServiceAttributes struct {
 	// Applicable to both Kubernetes and ServiceEntries.
 	LabelSelectors map[string]string
 
+	// Aliases is the resolved set of aliases for this service. This is computed based on a global view of all Service's `AliasFor`
+	// fields.
+	// For example, if I had two Services with `externalName: foo`, "a" and "b", then the "foo" service would have Aliases=[a,b].
+	Aliases []NamespacedHostname
+
 	// For Kubernetes platform
 
 	// ClusterExternalAddresses is a mapping between a cluster name and the external
@@ -695,6 +702,11 @@ type ServiceAttributes struct {
 	ClusterExternalPorts map[cluster.ID]map[uint32]uint32
 
 	K8sAttributes
+}
+
+type NamespacedHostname struct {
+	Hostname  host.Name
+	Namespace string
 }
 
 type K8sAttributes struct {
@@ -751,6 +763,8 @@ func (s *ServiceAttributes) DeepCopy() ServiceAttributes {
 		}
 	}
 
+	out.Aliases = slices.Clone(s.Aliases)
+
 	// AddressMap contains a mutex, which is safe to return a copy in this case.
 	// nolint: govet
 	return out
@@ -774,6 +788,10 @@ func (s *ServiceAttributes) Equals(other *ServiceAttributes) bool {
 	}
 
 	if !maps.Equal(s.ExportTo, other.ExportTo) {
+		return false
+	}
+
+	if !slices.Equal(s.Aliases, other.Aliases) {
 		return false
 	}
 
@@ -844,7 +862,7 @@ type AmbientIndexes interface {
 		proxy *Proxy,
 		allAddresses sets.String,
 		currentSubs sets.String,
-	) sets.Set[string]
+	) sets.String
 	Policies(requested sets.Set[ConfigKey]) []*security.Authorization
 	Waypoint(scope WaypointScope) []netip.Addr
 	WorkloadsForWaypoint(scope WaypointScope) []*WorkloadInfo
@@ -927,10 +945,20 @@ func serviceResourceName(s *workloadapi.Service) string {
 	return s.Namespace + "/" + s.Hostname
 }
 
+type WorkloadSource string
+
+const (
+	WorkloadSourcePod           WorkloadSource = "pod"
+	WorkloadSourceServiceEntry  WorkloadSource = "serviceentry"
+	WorkloadSourceWorkloadEntry WorkloadSource = "workloadentry"
+)
+
 type WorkloadInfo struct {
 	*workloadapi.Workload
 	// Labels for the workload. Note these are only used internally, not sent over XDS
 	Labels map[string]string
+	// Source of the workload. Note this is used internally only.
+	Source WorkloadSource
 }
 
 func workloadResourceName(w *workloadapi.Workload) string {
@@ -941,6 +969,7 @@ func (i *WorkloadInfo) Clone() *WorkloadInfo {
 	return &WorkloadInfo{
 		Workload: proto.Clone(i).(*workloadapi.Workload),
 		Labels:   maps.Clone(i.Labels),
+		Source:   i.Source,
 	}
 }
 
@@ -1062,34 +1091,55 @@ func IsDNSSrvSubsetKey(s string) bool {
 	return false
 }
 
+// ParseSubsetKeyHostname is an optimized specialization of ParseSubsetKey that only returns the hostname.
+// This is created as this is used in some hot paths and is about 2x faster than ParseSubsetKey; for typical use ParseSubsetKey is sufficient (and zero-alloc).
+func ParseSubsetKeyHostname(s string) (hostname string) {
+	idx := strings.LastIndex(s, "|")
+	if idx == -1 {
+		// Could be DNS SRV format.
+		// Do not do LastIndex("_."), as those are valid characters in the hostname (unlike |)
+		// Fallback to the full parser.
+		_, _, hostname, _ := ParseSubsetKey(s)
+		return string(hostname)
+	}
+	return s[idx+1:]
+}
+
 // ParseSubsetKey is the inverse of the BuildSubsetKey method
 func ParseSubsetKey(s string) (direction TrafficDirection, subsetName string, hostname host.Name, port int) {
-	var parts []string
-	dnsSrvMode := false
+	sep := "|"
 	// This could be the DNS srv form of the cluster that uses outbound_.port_.subset_.hostname
 	// Since we do not want every callsite to implement the logic to differentiate between the two forms
 	// we add an alternate parser here.
 	if strings.HasPrefix(s, trafficDirectionOutboundSrvPrefix) ||
 		strings.HasPrefix(s, trafficDirectionInboundSrvPrefix) {
-		parts = strings.SplitN(s, ".", 4)
-		dnsSrvMode = true
-	} else {
-		parts = strings.Split(s, "|")
+		sep = "_."
 	}
 
-	if len(parts) < 4 {
+	// Format: dir|port|subset|hostname
+	dir, s, ok := strings.Cut(s, sep)
+	if !ok {
 		return
 	}
+	direction = TrafficDirection(dir)
 
-	direction = TrafficDirection(strings.TrimSuffix(parts[0], "_"))
-	port, _ = strconv.Atoi(strings.TrimSuffix(parts[1], "_"))
-	subsetName = parts[2]
-
-	if dnsSrvMode {
-		subsetName = strings.TrimSuffix(parts[2], "_")
+	p, s, ok := strings.Cut(s, sep)
+	if !ok {
+		return
 	}
+	port, _ = strconv.Atoi(p)
 
-	hostname = host.Name(parts[3])
+	ss, s, ok := strings.Cut(s, sep)
+	if !ok {
+		return
+	}
+	subsetName = ss
+
+	// last part. No | remains -- verify this
+	if strings.Contains(s, sep) {
+		return
+	}
+	hostname = host.Name(s)
 	return
 }
 
@@ -1223,7 +1273,8 @@ func (s *Service) Equals(other *Service) bool {
 	}
 
 	return s.DefaultAddress == other.DefaultAddress && s.AutoAllocatedIPv4Address == other.AutoAllocatedIPv4Address &&
-		s.AutoAllocatedIPv6Address == other.AutoAllocatedIPv6Address && s.Hostname == other.Hostname && s.MeshExternal == other.MeshExternal
+		s.AutoAllocatedIPv6Address == other.AutoAllocatedIPv6Address && s.Hostname == other.Hostname &&
+		s.Resolution == other.Resolution && s.MeshExternal == other.MeshExternal
 }
 
 // DeepCopy creates a clone of IstioEndpoint.

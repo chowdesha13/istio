@@ -20,13 +20,20 @@ import (
 	"testing"
 	"time"
 
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
+	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
+	headerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/header/v3"
+	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	meshapi "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
@@ -275,6 +282,24 @@ func TestGenerateVirtualHostDomains(t *testing.T) {
 				"[2406:3003:2064:35b8:864:a648:4b96:e37d]",
 			},
 			enableDualStack: true,
+		},
+		{
+			name: "alias",
+			service: &model.Service{
+				Hostname:     "foo.local.campus.net",
+				MeshExternal: false,
+				Attributes:   model.ServiceAttributes{Aliases: []model.NamespacedHostname{{Hostname: "alias.local.campus.net", Namespace: "ns"}}},
+			},
+			port: 80,
+			node: &model.Proxy{
+				DNSDomain: "local.campus.net",
+			},
+			want: []string{
+				"foo.local.campus.net",
+				"foo",
+				"alias.local.campus.net",
+				"alias",
+			},
 		},
 	}
 
@@ -552,6 +577,150 @@ func TestSidecarOutboundHTTPRouteConfigWithDuplicateHosts(t *testing.T) {
 	}
 }
 
+func TestSidecarStatefulsessionFilter(t *testing.T) {
+	virtualServiceSpec := &networking.VirtualService{
+		Hosts:    []string{"test-service.default.svc.cluster.local", "test-service.svc.mesh.acme.net"},
+		Gateways: []string{"mesh"},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host: "test-service.default.svc.cluster.local",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// TODO(ramaraochavali): Add more test cases.
+	cases := []struct {
+		name                  string
+		services              []*model.Service
+		config                []config.Config
+		expectStatefulSession *statefulsession.StatefulSessionPerRoute
+	}{
+		{
+			"session filter with no labels on service",
+			[]*model.Service{
+				buildHTTPService("test-service.default.svc.cluster.local", visibility.Public, "", "default", 80),
+			},
+			[]config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "acme",
+				},
+				Spec: virtualServiceSpec,
+			}},
+			nil,
+		},
+		{
+			"session filter with header",
+			[]*model.Service{
+				buildHTTPServiceWithLabels("test-service.default.svc.cluster.local", visibility.Public, "", "default",
+					map[string]string{"istio.io/persistent-session-header": "x-session-header"}, 80),
+			},
+			[]config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "acme",
+				},
+				Spec: virtualServiceSpec,
+			}},
+			&statefulsession.StatefulSessionPerRoute{
+				Override: &statefulsession.StatefulSessionPerRoute_StatefulSession{
+					StatefulSession: &statefulsession.StatefulSession{
+						SessionState: &core.TypedExtensionConfig{
+							Name: "envoy.http.stateful_session.header",
+							TypedConfig: protoconv.MessageToAny(&headerv3.HeaderBasedSessionState{
+								Name: "x-session-header",
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			"session filter with cookie",
+			[]*model.Service{
+				buildHTTPServiceWithLabels("test-service.default.svc.cluster.local", visibility.Public, "", "default",
+					map[string]string{"istio.io/persistent-session": "x-session-id"}, 80),
+			},
+			[]config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "acme",
+				},
+				Spec: virtualServiceSpec,
+			}},
+			&statefulsession.StatefulSessionPerRoute{
+				Override: &statefulsession.StatefulSessionPerRoute_StatefulSession{
+					StatefulSession: &statefulsession.StatefulSession{
+						SessionState: &core.TypedExtensionConfig{
+							Name: "envoy.http.stateful_session.cookie",
+							TypedConfig: protoconv.MessageToAny(&cookiev3.CookieBasedSessionState{
+								Cookie: &httpv3.Cookie{
+									Name: "x-session-id",
+									Path: "/",
+									Ttl: &durationpb.Duration{
+										Seconds: 120,
+									},
+								},
+							}),
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			// ensure services are ordered
+			t0 := time.Now()
+			for _, svc := range tt.services {
+				svc.CreationTime = t0
+				t0 = t0.Add(time.Minute)
+			}
+			cg := NewConfigGenTest(t, TestOptions{
+				Services: tt.services,
+				Configs:  tt.config,
+			})
+
+			vHostCache := make(map[int][]*route.VirtualHost)
+			resource, _ := cg.ConfigGen.buildSidecarOutboundHTTPRouteConfig(
+				cg.SetupProxy(nil), &model.PushRequest{Push: cg.PushContext()}, "80", vHostCache, nil, nil)
+			routeCfg := &route.RouteConfiguration{}
+			resource.Resource.UnmarshalTo(routeCfg)
+			xdstest.ValidateRouteConfiguration(t, routeCfg)
+
+			for _, vh := range routeCfg.VirtualHosts {
+				if vh.Name == "allow_any" {
+					continue
+				}
+				if len(vh.Routes) == 0 {
+					t.Fatalf("expected routes to be found but not %s", vh.Name)
+				}
+				for _, r := range vh.Routes {
+					if tt.expectStatefulSession == nil {
+						if r.TypedPerFilterConfig != nil &&
+							r.TypedPerFilterConfig["envoy.filters.http.stateful_session"] != nil {
+							t.Fatalf("stateful session config is not expected but found for %s, %s", vh.Name, r.Name)
+						}
+					} else {
+						if r.TypedPerFilterConfig == nil && r.TypedPerFilterConfig["envoy.filters.http.stateful_session"] == nil {
+							t.Fatalf("expected stateful session config but not found for %s, %s", vh.Name, r.Name)
+						}
+						incomingStatefulSession := &statefulsession.StatefulSessionPerRoute{}
+						r.TypedPerFilterConfig["envoy.filters.http.stateful_session"].UnmarshalTo(incomingStatefulSession)
+						assert.Equal(t, incomingStatefulSession, tt.expectStatefulSession)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 	services := []*model.Service{
 		buildHTTPService("bookinfo.com", visibility.Public, wildcardIPv4, "default", 9999, 70),
@@ -572,7 +741,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 		Spec: &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// A port that is not in any of the services
 						Number:   9000,
 						Protocol: "HTTP",
@@ -582,7 +751,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/bookinfo.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// Unix domain socket listener
 						Number:   0,
 						Protocol: "HTTP",
@@ -592,7 +761,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/bookinfo.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// Unix domain socket listener
 						Number:   0,
 						Protocol: "HTTP",
@@ -602,7 +771,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/test-headless.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// A port that is in one of the services
 						Number:   8080,
 						Protocol: "HTTP",
@@ -626,7 +795,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 		Spec: &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						Number:   7443,
 						Protocol: "HTTP",
 						Name:     "something",
@@ -645,7 +814,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 		Spec: &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						Number:   7443,
 						Protocol: "HTTP_PROXY",
 						Name:     "something",
@@ -664,7 +833,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 		Spec: &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// A port that is not in any of the services
 						Number:   9000,
 						Protocol: "HTTP",
@@ -674,7 +843,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/bookinfo.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// Unix domain socket listener
 						Number:   0,
 						Protocol: "HTTP",
@@ -684,7 +853,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/bookinfo.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						Number:   0,
 						Protocol: "HTTP",
 						Name:     "something",
@@ -693,7 +862,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/test-headless.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						Number:   18888,
 						Protocol: "HTTP",
 						Name:     "foo",
@@ -719,7 +888,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 		Spec: &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// A port that is not in any of the services
 						Number:   9000,
 						Protocol: "HTTP",
@@ -729,7 +898,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/bookinfo.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// Unix domain socket listener
 						Number:   0,
 						Protocol: "HTTP",
@@ -739,7 +908,7 @@ func TestSidecarOutboundHTTPRouteConfig(t *testing.T) {
 					Hosts: []string{"*/bookinfo.com"},
 				},
 				{
-					Port: &networking.Port{
+					Port: &networking.SidecarPort{
 						// A port that is in one of the services
 						Number:   8080,
 						Protocol: "HTTP",
@@ -1652,6 +1821,12 @@ func testSidecarRDSVHosts(t *testing.T, services []*model.Service,
 	if (expectedRoutes >= 0) && (numberOfRoutes != expectedRoutes) {
 		t.Errorf("Wrong number of routes. expected: %v, Got: %v", expectedRoutes, numberOfRoutes)
 	}
+}
+
+func buildHTTPServiceWithLabels(hostname string, v visibility.Instance, ip, namespace string, labels map[string]string, ports ...int) *model.Service {
+	svc := buildHTTPService(hostname, v, ip, namespace, ports...)
+	svc.Attributes.Labels = labels
+	return svc
 }
 
 func buildHTTPService(hostname string, v visibility.Instance, ip, namespace string, ports ...int) *model.Service {

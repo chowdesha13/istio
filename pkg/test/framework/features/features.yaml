@@ -88,6 +88,7 @@ features:
       file-mounted-certs:
       ecc-signature-algorithm:
       multiple-root:
+      cacert-rotation:
     user:
     ingress:
       mtls:
@@ -119,6 +120,7 @@ features:
       mtls-local:
       jwt-token:
       workload-selector:
+      policy-attachment:
       deny-action:
       negative-match:
       ingress-gateway:
@@ -159,6 +161,7 @@ features:
       uninstall_revision:
       uninstall_manifest:
       uninstall_purge:
+      uninstall_file:
       postinstall_verify:
       revision_centric_view:
       revision_tags:

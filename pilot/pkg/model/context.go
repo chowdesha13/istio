@@ -718,6 +718,9 @@ type NodeMetadata struct {
 	// The istiod address when running ASM Managed Control Plane.
 	CloudrunAddr string `json:"CLOUDRUN_ADDR,omitempty"`
 
+	// Metadata discovery service enablement
+	MetadataDiscovery StringBool `json:"METADATA_DISCOVERY,omitempty"`
+
 	// Contains a copy of the raw metadata. This is needed to lookup arbitrary values.
 	// If a value is known ahead of time it should be added to the struct rather than reading from here,
 	Raw map[string]any `json:"-"`
@@ -1017,11 +1020,11 @@ func ParseMetadata(metadata *structpb.Struct) (*NodeMetadata, error) {
 		return &NodeMetadata{}, nil
 	}
 
-	boostrapNodeMeta, err := ParseBootstrapNodeMetadata(metadata)
+	bootstrapNodeMeta, err := ParseBootstrapNodeMetadata(metadata)
 	if err != nil {
 		return nil, err
 	}
-	return &boostrapNodeMeta.NodeMetadata, nil
+	return &bootstrapNodeMeta.NodeMetadata, nil
 }
 
 // ParseBootstrapNodeMetadata parses the opaque Metadata from an Envoy Node into string key-value pairs.
@@ -1333,6 +1336,13 @@ func (node *Proxy) WorkloadEntry() (string, bool) {
 	node.RLock()
 	defer node.RUnlock()
 	return node.workloadEntryName, node.workloadEntryAutoCreated
+}
+
+// SupportsEnvoyExtendedJwt indicates that the proxy JWT extension is capable of
+// replacing istio_authn filter.
+func (node *Proxy) SupportsEnvoyExtendedJwt() bool {
+	return node.IstioVersion == nil ||
+		node.IstioVersion.Compare(&IstioVersion{Major: 1, Minor: 21, Patch: -1}) >= 0
 }
 
 type GatewayController interface {

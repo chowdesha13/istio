@@ -6,7 +6,6 @@
     "certSigners": [],
     "configCluster": false,
     "configValidation": true,
-    "defaultNodeSelector": {},
     "defaultPodDisruptionBudget": {
       "enabled": true
     },
@@ -70,6 +69,10 @@
           "memory": "128Mi"
         }
       },
+      "startupProbe": {
+        "enabled": true,
+        "failureThreshold": 600
+      },
       "statusPort": 123,
       "tracer": "zipkin"
     },
@@ -86,13 +89,6 @@
       "servicePort": 0
     },
     "tag": "latest",
-    "tracer": {
-      "datadog": {},
-      "lightstep": {},
-      "stackdriver": {},
-      "zipkin": {}
-    },
-    "useMCP": false,
     "variant": ""
   },
   "istio_cni": {

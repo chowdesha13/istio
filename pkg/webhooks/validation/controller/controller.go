@@ -36,11 +36,13 @@ import (
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/keycertbundle"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/webhooks/util"
 )
 
@@ -153,12 +155,8 @@ func (c *Controller) Reconcile(key types.NamespacedName) error {
 		// no point in retrying unless cert file changes.
 		return nil
 	}
-	failurePolicy := kubeApiAdmission.Ignore
 	ready := c.readyForFailClose()
-	if ready {
-		failurePolicy = kubeApiAdmission.Fail
-	}
-	if err := c.updateValidatingWebhookConfiguration(whc, caBundle, failurePolicy); err != nil {
+	if err := c.updateValidatingWebhookConfiguration(whc, caBundle, ready); err != nil {
 		return fmt.Errorf("fail to update webhook: %v", err)
 	}
 	if !ready {
@@ -222,6 +220,12 @@ func (c *Controller) isDryRunOfInvalidConfigRejected() (rejected bool, reason st
 			Labels: map[string]string{
 				label.IoIstioRev.Name: c.o.Revision,
 			},
+			Annotations: map[string]string{
+				// Add always-reject annotation. For now, we are invalid for two reasons: missing `spec.servers`, and this
+				// annotation. In the future, the CRD will reject a missing `spec.servers` before we hit the webhook, so we will
+				// only have that annotation. For backwards compatibility, we keep both methods for some time.
+				constants.AlwaysReject: "true",
+			},
 		},
 		Spec: networking.Gateway{},
 	}
@@ -256,37 +260,42 @@ func (c *Controller) isDryRunOfInvalidConfigRejected() (rejected bool, reason st
 }
 
 func (c *Controller) updateValidatingWebhookConfiguration(current *kubeApiAdmission.ValidatingWebhookConfiguration,
-	caBundle []byte, failurePolicy kubeApiAdmission.FailurePolicyType,
+	caBundle []byte, ready bool,
 ) error {
 	dirty := false
 	for i := range current.Webhooks {
-		if !bytes.Equal(current.Webhooks[i].ClientConfig.CABundle, caBundle) ||
-			(current.Webhooks[i].FailurePolicy != nil && *current.Webhooks[i].FailurePolicy != failurePolicy) {
+		caNeed := !bytes.Equal(current.Webhooks[i].ClientConfig.CABundle, caBundle)
+		failureNeed := ready && (current.Webhooks[i].FailurePolicy != nil && *current.Webhooks[i].FailurePolicy != kubeApiAdmission.Fail)
+		if caNeed || failureNeed {
 			dirty = true
 			break
 		}
 	}
+	scope := scope.WithLabels(
+		"name", current.Name,
+		"fail closed", ready,
+		"resource version", current.ResourceVersion,
+	)
 	if !dirty {
-		scope.Infof("validatingwebhookconfiguration %v (failurePolicy=%v, resourceVersion=%v) is up-to-date. No change required.",
-			current.Name, failurePolicy, current.ResourceVersion)
+		scope.Infof("up-to-date, no change required")
 		return nil
 	}
 	updated := current.DeepCopy()
 	for i := range updated.Webhooks {
 		updated.Webhooks[i].ClientConfig.CABundle = caBundle
-		updated.Webhooks[i].FailurePolicy = &failurePolicy
+		if ready {
+			updated.Webhooks[i].FailurePolicy = ptr.Of(kubeApiAdmission.Fail)
+		}
 	}
 
 	latest, err := c.webhooks.Update(updated)
 	if err != nil {
-		scope.Errorf("Failed to update validatingwebhookconfiguration %v (failurePolicy=%v, resourceVersion=%v): %v",
-			updated.Name, failurePolicy, updated.ResourceVersion, err)
+		scope.Errorf("failed to updated: %v", err)
 		reportValidationConfigUpdateError(kerrors.ReasonForError(err))
 		return err
 	}
 
-	scope.Infof("Successfully updated validatingwebhookconfiguration %v (failurePolicy=%v,resourceVersion=%v)",
-		updated.Name, failurePolicy, latest.ResourceVersion)
+	scope.WithLabels("resource version", latest.ResourceVersion).Infof("successfully updated")
 	reportValidationConfigUpdate()
 	return nil
 }

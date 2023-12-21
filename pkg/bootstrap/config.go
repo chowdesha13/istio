@@ -72,6 +72,12 @@ const (
 	v2Suffix   = ",component,istio"
 )
 
+var envoyWellKnownCompressorLibrary = sets.String{
+	"gzip":   {},
+	"zstd":   {},
+	"brotli": {},
+}
+
 // Config for creating a bootstrap file.
 type Config struct {
 	*model.Node
@@ -89,7 +95,7 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 	}
 
 	// Waypoint overrides
-	metadataDiscovery := false
+	metadataDiscovery := cfg.Metadata.MetadataDiscovery
 	if strings.HasPrefix(cfg.ID, "waypoint~") {
 		xdsType = "DELTA_GRPC"
 		metadataDiscovery = true
@@ -103,7 +109,7 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 		option.DiscoveryHost(discHost),
 		option.Metadata(cfg.Metadata),
 		option.XdsType(xdsType),
-		option.MetadataDiscovery(metadataDiscovery))
+		option.MetadataDiscovery(bool(metadataDiscovery)))
 
 	// Add GCPProjectNumber to access in bootstrap template.
 	md := cfg.Metadata.PlatformMetadata
@@ -274,6 +280,12 @@ func getStatsOptions(meta *model.BootstrapNodeMetadata) []option.Instance {
 		}
 	}
 
+	var compression string
+	// TODO: move annotation to api repo
+	if statsCompression, ok := meta.Annotations["sidecar.istio.io/statsCompression"]; ok && envoyWellKnownCompressorLibrary.Contains(statsCompression) {
+		compression = statsCompression
+	}
+
 	return []option.Instance{
 		option.EnvoyStatsMatcherInclusionPrefix(parseOption(prefixAnno,
 			requiredEnvoyStatsMatcherInclusionPrefixes, proxyConfigPrefixes)),
@@ -282,6 +294,7 @@ func getStatsOptions(meta *model.BootstrapNodeMetadata) []option.Instance {
 		option.EnvoyStatsMatcherInclusionRegexp(parseOption(RegexAnno, requiredEnvoyStatsMatcherInclusionRegexes, proxyConfigRegexps)),
 		option.EnvoyExtraStatTags(extraStatTags),
 		option.EnvoyHistogramBuckets(buckets),
+		option.EnvoyStatsCompression(compression),
 	}
 }
 
@@ -550,6 +563,7 @@ type MetadataOptions struct {
 	EnvoyStatusPort             int
 	EnvoyPrometheusPort         int
 	ExitOnZeroActiveConnections bool
+	MetadataDiscovery           bool
 }
 
 const (
@@ -605,6 +619,7 @@ func GetNodeMetaData(options MetadataOptions) (*model.Node, error) {
 	meta.EnvoyStatusPort = options.EnvoyStatusPort
 	meta.EnvoyPrometheusPort = options.EnvoyPrometheusPort
 	meta.ExitOnZeroActiveConnections = model.StringBool(options.ExitOnZeroActiveConnections)
+	meta.MetadataDiscovery = model.StringBool(options.MetadataDiscovery)
 
 	meta.ProxyConfig = (*model.NodeMetaProxyConfig)(options.ProxyConfig)
 

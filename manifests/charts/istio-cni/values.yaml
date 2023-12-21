@@ -20,6 +20,10 @@ cni:
   cniBinDir: "" # Auto-detected based on version; defaults to /opt/cni/bin.
   cniConfDir: /etc/cni/net.d
   cniConfFileName: ""
+  # This directory must exist on the node, if it does not, consult your container runtime
+  # documentation for the appropriate path.
+  cniNetnsDir: # Defaults to '/var/run/netns', in minikube/docker/others can be '/var/run/docker/netns'.
+
 
   excludeNamespaces:
     - istio-system
@@ -31,18 +35,12 @@ cni:
   # Custom annotations on pod level, if you need them
   podAnnotations: {}
 
-  # If this value is set a RoleBinding will be created
-  # in the same namespace as the istio-cni DaemonSet is created.
-  # This can be used to bind a preexisting ClusterRole to the istio/cni ServiceAccount
-  # e.g. if you use PodSecurityPolicies
-  psp_cluster_role: ""
-
   # Deploy the config files as plugin chain (value "true") or as standalone files in the conf dir (value "false")?
   # Some k8s flavors (e.g. OpenShift) do not support the chain approach, set to false if this is the case
   chained: true
 
-  # Allow the istio-cni container to run in privileged mode, needed for some platforms (e.g. OpenShift)
-  privileged: false
+  # Allow the istio-cni container to run in privileged mode, needed for some platforms (e.g. OpenShift) or features (repairPods)
+  privileged: true
 
   # Custom configuration happens based on the CNI provider.
   # Possible values: "default", "multus"
@@ -63,8 +61,20 @@ cni:
     hub: ""
     tag: ""
 
-    labelPods: true
-    deletePods: true
+    # Repair controller has 3 modes. Pick which one meets your use cases. Note only one may be used.
+    # This defines the action the controller will take when a pod is detected as broken.
+
+    # labelPods will label all pods with <brokenPodLabelKey>=<brokenPodLabelValue>.
+    # This is only capable of identifying broken pods; the user is responsible for fixing them (generally, by deleting them).
+    # Note this gives the DaemonSet a relatively high privilege, as modifying pod metadata/status can have wider impacts.
+    labelPods: false
+    # deletePods will delete any broken pod. These will then be rescheduled, hopefully onto a node that is fully ready.
+    # Note this gives the DaemonSet a relatively high privilege, as it can delete any Pod.
+    deletePods: false
+    # repairPods will dynamically repair any broken pod by setting up the pod networking configuration even after it has started.
+    # Note the pod will be crashlooping, so this may take a few minutes to become fully functional based on when the retry occurs.
+    # This requires no RBAC privilege, but does require `securityContext.privileged`.
+    repairPods: true
 
     initContainerName: "istio-validation"
 

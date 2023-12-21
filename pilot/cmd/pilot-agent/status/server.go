@@ -43,6 +43,7 @@ import (
 	grpcHealth "google.golang.org/grpc/health/grpc_health_v1"
 	grpcStatus "google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	k8sUtilIo "k8s.io/utils/io"
 
 	"istio.io/istio/pilot/cmd/pilot-agent/metrics"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/grpcready"
@@ -54,6 +55,7 @@ import (
 	"istio.io/istio/pkg/kube/apimirror"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/monitoring"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/slices"
 )
 
@@ -61,7 +63,8 @@ const (
 	// readyPath is for the pilot agent readiness itself.
 	readyPath = "/healthz/ready"
 	// quitPath is to notify the pilot agent to quit.
-	quitPath = "/quitquitquit"
+	quitPath  = "/quitquitquit"
+	drainPath = "/drain"
 	// KubeAppProberEnvName is the name of the command line flag for pilot agent to pass app prober config.
 	// The json encoded string to pass app HTTP probe information from injector(istioctl or webhook).
 	// For example, ISTIO_KUBE_APP_PROBERS='{"/app-health/httpbin/livez":{"httpGet":{"path": "/hello", "port": 8080}}.
@@ -69,8 +72,9 @@ const (
 	// This environment variable should never be set manually.
 	KubeAppProberEnvName = "ISTIO_KUBE_APP_PROBERS"
 
-	localHostIPv4 = "127.0.0.1"
-	localHostIPv6 = "::1"
+	localHostIPv4     = "127.0.0.1"
+	localHostIPv6     = "::1"
+	maxRespBodyLength = 10 * 1 << 10
 )
 
 var (
@@ -128,6 +132,8 @@ type Options struct {
 	EnableProfiling     bool
 	// PrometheusRegistry to use. Just for testing.
 	PrometheusRegistry prometheus.Gatherer
+	Shutdown           context.CancelFunc
+	TriggerDrain       func()
 }
 
 // Server provides an endpoint for handling status probes.
@@ -147,6 +153,8 @@ type Server struct {
 	http                  *http.Client
 	enableProfiling       bool
 	registry              prometheus.Gatherer
+	shutdown              context.CancelFunc
+	drain                 func()
 }
 
 func initializeMonitoring() (prometheus.Gatherer, error) {
@@ -212,6 +220,10 @@ func NewServer(config Options) (*Server, error) {
 		config:                config,
 		enableProfiling:       config.EnableProfiling,
 		registry:              registry,
+		shutdown: func() {
+			config.Shutdown()
+		},
+		drain: config.TriggerDrain,
 	}
 	if LegacyLocalhostProbeDestination.Get() {
 		s.appProbersDestination = "localhost"
@@ -358,6 +370,7 @@ func (s *Server) Run(ctx context.Context) {
 	// Keep for backward compat with configs.
 	mux.HandleFunc(`/stats/prometheus`, s.handleStats)
 	mux.HandleFunc(quitPath, s.handleQuit)
+	mux.HandleFunc(drainPath, s.handleDrain)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
 
 	if s.enableProfiling {
@@ -387,7 +400,9 @@ func (s *Server) Run(ctx context.Context) {
 
 	go func() {
 		if err := http.Serve(l, mux); err != nil {
-			log.Error(err)
+			if network.IsUnexpectedListenerError(err) {
+				log.Error(err)
+			}
 			select {
 			case <-ctx.Done():
 				// We are shutting down already, don't trigger SIGTERM
@@ -671,7 +686,22 @@ func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 	log.Infof("handling %s, notifying pilot-agent to exit", quitPath)
-	notifyExit()
+	s.shutdown()
+}
+
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	if !isRequestFromLocalhost(r) {
+		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+	log.Infof("handling %s, starting drain", drainPath)
+	s.drain()
 }
 
 func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
@@ -760,6 +790,9 @@ func (s *Server) handleAppProbeHTTPGet(w http.ResponseWriter, req *http.Request,
 	}
 	// We only write the status code to the response.
 	w.WriteHeader(response.StatusCode)
+	// Return the body from probe as well
+	b, _ := k8sUtilIo.ReadAtMost(response.Body, maxRespBodyLength)
+	_, _ = w.Write(b)
 }
 
 func (s *Server) handleAppProbeTCPSocket(w http.ResponseWriter, prober *Prober) {

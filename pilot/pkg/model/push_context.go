@@ -15,6 +15,7 @@
 package model
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -30,16 +31,19 @@ import (
 	extensions "istio.io/api/extensions/v1alpha1"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/config/security"
 	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/jwt"
 	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/slices"
@@ -186,7 +190,6 @@ func newGatewayIndex() gatewayIndex {
 type serviceAccountKey struct {
 	hostname  host.Name
 	namespace string
-	port      int
 }
 
 // PushContext tracks the status of a push - metrics and errors.
@@ -811,7 +814,7 @@ func (ps *PushContext) GatewayServices(proxy *Proxy) []*Service {
 	}
 
 	// host set.
-	hostsFromGateways := sets.String{}
+	hostsFromGateways := ps.extraGatewayServices(proxy)
 	for _, gw := range proxy.MergedGateway.GatewayNameForServer {
 		hostsFromGateways.Merge(ps.virtualServiceIndex.destinationsByGateway[gw])
 	}
@@ -827,7 +830,7 @@ func (ps *PushContext) GatewayServices(proxy *Proxy) []*Service {
 		}
 	}
 
-	log.Debugf("GatewayServices:: gateways len(services)=%d, len(filtered)=%d", len(svcs), len(gwSvcs))
+	log.Debugf("GatewayServices: gateways len(services)=%d, len(filtered)=%d", len(svcs), len(gwSvcs))
 
 	return gwSvcs
 }
@@ -853,10 +856,10 @@ func (ps *PushContext) ServiceAttachedToGateway(hostname string, proxy *Proxy) b
 			}
 		}
 	}
-	return false
+	return ps.extraGatewayServices(proxy).Contains(hostname)
 }
 
-// wellknownProviders is a lsit of all known providers.
+// wellknownProviders is a list of all known providers.
 // This exists
 var wellknownProviders = sets.New(
 	"envoy_ext_authz_http",
@@ -883,12 +886,16 @@ func AssertProvidersHandled(expected int) {
 
 // addHostsFromMeshConfigProvidersHandled contains the number of providers we handle below.
 // This is to ensure this stays in sync as new handlers are added
-// STOP. DO NOT UPDATE THIS WITHOUT UPDATING addHostsFromMeshConfig.
+// STOP. DO NOT UPDATE THIS WITHOUT UPDATING extraGatewayServices.
 const addHostsFromMeshConfigProvidersHandled = 14
 
-// add services from MeshConfig.ExtensionProviders
+// extraGatewayServices returns a subset of services referred from the proxy gateways, including:
+// 1. MeshConfig.ExtensionProviders
+// 2. RequestAuthentication.JwtRules.JwksUri
 // TODO: include cluster from EnvoyFilter such as global ratelimit [demo](https://istio.io/latest/docs/tasks/policy-enforcement/rate-limit/#global-rate-limit)
-func addHostsFromMeshConfig(ps *PushContext, hosts sets.String) {
+func (ps *PushContext) extraGatewayServices(proxy *Proxy) sets.String {
+	hosts := sets.String{}
+	// add services from MeshConfig.ExtensionProviders
 	for _, prov := range ps.Mesh.ExtensionProviders {
 		switch p := prov.Provider.(type) {
 		case *meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp:
@@ -919,6 +926,22 @@ func addHostsFromMeshConfig(ps *PushContext, hosts sets.String) {
 		case *meshconfig.MeshConfig_ExtensionProvider_Stackdriver: // No services
 		}
 	}
+	// add services from RequestAuthentication.JwtRules.JwksUri
+	if features.JwksFetchMode != jwt.Istiod {
+		jwtPolicies := ps.AuthnPolicies.GetJwtPoliciesForWorkload(proxy.Metadata.Namespace, proxy.Labels, false)
+		for _, cfg := range jwtPolicies {
+			rules := cfg.Spec.(*v1beta1.RequestAuthentication).JwtRules
+			for _, r := range rules {
+				if uri := r.GetJwksUri(); len(uri) > 0 {
+					jwksInfo, err := security.ParseJwksURI(uri)
+					if err == nil {
+						hosts.Insert(jwksInfo.Hostname.String())
+					}
+				}
+			}
+		}
+	}
+	return hosts
 }
 
 // servicesExportedToNamespace returns the list of services that are visible to a namespace.
@@ -1255,7 +1278,7 @@ func (ps *PushContext) InitContext(env *Environment, oldPushContext *PushContext
 }
 
 func (ps *PushContext) createNewContext(env *Environment) error {
-	ps.initServiceRegistry(env)
+	ps.initServiceRegistry(env, nil)
 
 	if err := ps.initKubernetesGateways(env); err != nil {
 		return err
@@ -1328,7 +1351,7 @@ func (ps *PushContext) updateContext(
 
 	if servicesChanged {
 		// Services have changed. initialize service registry
-		ps.initServiceRegistry(env)
+		ps.initServiceRegistry(env, pushReq.ConfigsUpdated)
 	} else {
 		// make sure we copy over things that would be generated in initServiceRegistry
 		ps.ServiceIndex = oldPushContext.ServiceIndex
@@ -1414,9 +1437,13 @@ func (ps *PushContext) updateContext(
 
 // Caches list of services in the registry, and creates a map
 // of hostname to service
-func (ps *PushContext) initServiceRegistry(env *Environment) {
+func (ps *PushContext) initServiceRegistry(env *Environment, configsUpdate sets.Set[ConfigKey]) {
 	// Sort the services in order of creation.
 	allServices := SortServicesByCreationTime(env.Services())
+	if features.EnableExternalNameAlias {
+		resolveServiceAliases(allServices, configsUpdate)
+	}
+
 	for _, s := range allServices {
 		portMap := map[string]int{}
 		for _, port := range s.Ports {
@@ -1434,7 +1461,18 @@ func (ps *PushContext) initServiceRegistry(env *Environment) {
 		if _, f := ps.ServiceIndex.HostnameAndNamespace[s.Hostname]; !f {
 			ps.ServiceIndex.HostnameAndNamespace[s.Hostname] = map[string]*Service{}
 		}
-		ps.ServiceIndex.HostnameAndNamespace[s.Hostname][s.Attributes.Namespace] = s
+		// In some scenarios, there may be multiple Services defined for the same hostname due to ServiceEntry allowing
+		// arbitrary hostnames. In these cases, we want to pick the first Service, which is the oldest. This ensures
+		// newly created Services cannot take ownership unexpectedly.
+		// However, the Service is from Kubernetes it should take precedence over ones not. This prevents someone from
+		// "domain squatting" on the hostname before a Kubernetes Service is created.
+		if existing := ps.ServiceIndex.HostnameAndNamespace[s.Hostname][s.Attributes.Namespace]; existing != nil &&
+			!(existing.Attributes.ServiceRegistry != provider.Kubernetes && s.Attributes.ServiceRegistry == provider.Kubernetes) {
+			log.Debugf("Service %s/%s from registry %s ignored by %s/%s/%s", s.Attributes.Namespace, s.Hostname, s.Attributes.ServiceRegistry,
+				existing.Attributes.ServiceRegistry, existing.Attributes.Namespace, existing.Hostname)
+		} else {
+			ps.ServiceIndex.HostnameAndNamespace[s.Hostname][s.Attributes.Namespace] = s
+		}
 
 		ns := s.Attributes.Namespace
 		if s.Attributes.ExportTo.IsEmpty() {
@@ -1452,22 +1490,123 @@ func (ps *PushContext) initServiceRegistry(env *Environment) {
 				continue
 			} else if s.Attributes.ExportTo.Contains(visibility.None) {
 				continue
-			} else {
-				// . or other namespaces
-				for exportTo := range s.Attributes.ExportTo {
-					if exportTo == visibility.Private || string(exportTo) == ns {
-						// exportTo with same namespace is effectively private
-						ps.ServiceIndex.privateByNamespace[ns] = append(ps.ServiceIndex.privateByNamespace[ns], s)
-					} else {
-						// exportTo is a specific target namespace
-						ps.ServiceIndex.exportedToNamespace[string(exportTo)] = append(ps.ServiceIndex.exportedToNamespace[string(exportTo)], s)
-					}
+			}
+			// . or other namespaces
+			for exportTo := range s.Attributes.ExportTo {
+				if exportTo == visibility.Private || string(exportTo) == ns {
+					// exportTo with same namespace is effectively private
+					ps.ServiceIndex.privateByNamespace[ns] = append(ps.ServiceIndex.privateByNamespace[ns], s)
+				} else {
+					// exportTo is a specific target namespace
+					ps.ServiceIndex.exportedToNamespace[string(exportTo)] = append(ps.ServiceIndex.exportedToNamespace[string(exportTo)], s)
 				}
 			}
 		}
 	}
 
 	ps.initServiceAccounts(env, allServices)
+}
+
+// resolveServiceAliases sets the Aliases attributes on all services. The incoming Service's will just have AliasFor set,
+// but in our usage we often need the opposite: for a given service, what are all the aliases?
+// resolveServiceAliases walks this 'graph' of services and updates the Alias field in-place.
+func resolveServiceAliases(allServices []*Service, configsUpdated sets.Set[ConfigKey]) {
+	// rawAlias builds a map of Service -> AliasFor. So this will be ExternalName -> Service.
+	// In an edge case, we can have ExternalName -> ExternalName; we resolve that below.
+	rawAlias := map[NamespacedHostname]host.Name{}
+	for _, s := range allServices {
+		if s.Resolution != Alias {
+			continue
+		}
+		nh := NamespacedHostname{
+			Hostname:  s.Hostname,
+			Namespace: s.Attributes.Namespace,
+		}
+		rawAlias[nh] = host.Name(s.Attributes.K8sAttributes.ExternalName)
+	}
+
+	// unnamespacedRawAlias is like rawAlias but without namespaces.
+	// This is because an `ExternalName` isn't namespaced. If there is a conflict, the behavior is undefined.
+	// This is split from above as a minor optimization to right-size the map
+	unnamespacedRawAlias := make(map[host.Name]host.Name, len(rawAlias))
+	for k, v := range rawAlias {
+		unnamespacedRawAlias[k.Hostname] = v
+	}
+
+	// resolvedAliases builds a map of Alias -> Concrete, fully resolving through multiple hops.
+	// Ex: Alias1 -> Alias2 -> Concrete will flatten to Alias1 -> Concrete.
+	resolvedAliases := make(map[NamespacedHostname]host.Name, len(rawAlias))
+	for alias, referencedService := range rawAlias {
+		// referencedService may be another alias or a concrete service.
+		if _, f := unnamespacedRawAlias[referencedService]; !f {
+			// Common case: alias pointing to a concrete service
+			resolvedAliases[alias] = referencedService
+			continue
+		}
+		// Otherwise, we need to traverse the alias "graph".
+		// In an obscure edge case, a user could make a loop, so we will need to handle that.
+		seen := sets.New(alias.Hostname, referencedService)
+		for {
+			n, f := unnamespacedRawAlias[referencedService]
+			if !f {
+				// The destination we are pointing to is not an alias, so this is the terminal step
+				resolvedAliases[alias] = referencedService
+				break
+			}
+			if seen.InsertContains(n) {
+				// We did a loop!
+				// Kubernetes will make these NXDomain, so we can just treat it like it doesn't exist at all
+				break
+			}
+			referencedService = n
+		}
+	}
+
+	// aliasesForService builds a map of Concrete -> []Aliases
+	// This basically reverses our resolvedAliased map, which is Alias -> Concrete,
+	aliasesForService := map[host.Name][]NamespacedHostname{}
+	for alias, concrete := range resolvedAliases {
+		aliasesForService[concrete] = append(aliasesForService[concrete], alias)
+
+		// We also need to update configsUpdated, such that any "alias" updated also marks the concrete service as updated.
+		aliasKey := ConfigKey{
+			Kind:      kind.ServiceEntry,
+			Name:      alias.Hostname.String(),
+			Namespace: alias.Namespace,
+		}
+		// Alias. We should mark all the concrete services as updated as well.
+		if configsUpdated.Contains(aliasKey) {
+			// We only have the hostname, but we need the namespace...
+			for _, svc := range allServices {
+				if svc.Hostname == concrete {
+					configsUpdated.Insert(ConfigKey{
+						Kind:      kind.ServiceEntry,
+						Name:      concrete.String(),
+						Namespace: svc.Attributes.Namespace,
+					})
+				}
+			}
+		}
+	}
+	// Sort aliases so order is deterministic.
+	for _, v := range aliasesForService {
+		slices.SortFunc(v, func(a, b NamespacedHostname) int {
+			if r := cmp.Compare(a.Namespace, b.Namespace); r != 0 {
+				return r
+			}
+			return cmp.Compare(a.Hostname, b.Hostname)
+		})
+	}
+
+	// Finally, we can traverse all services and update the ones that have aliases
+	for i, s := range allServices {
+		if aliases, f := aliasesForService[s.Hostname]; f {
+			// This service has an alias; set it. We need to make a copy since the underlying Service is shared
+			s = s.DeepCopy()
+			s.Attributes.Aliases = aliases
+			allServices[i] = s
+		}
+	}
 }
 
 // SortServicesByCreationTime sorts the list of services in ascending order by their creation time (if available).
@@ -1489,31 +1628,29 @@ func SortServicesByCreationTime(services []*Service) []*Service {
 // Caches list of service accounts in the registry
 func (ps *PushContext) initServiceAccounts(env *Environment, services []*Service) {
 	for _, svc := range services {
-		for _, port := range svc.Ports {
-			if port.Protocol == protocol.UDP {
-				continue
-			}
-			var accounts sets.String
-			func() {
-				// First get endpoint level service accounts
-				shard, f := env.EndpointIndex.ShardsForService(string(svc.Hostname), svc.Attributes.Namespace)
-				if f {
-					shard.RLock()
-					defer shard.RUnlock()
-					accounts = shard.ServiceAccounts
-				}
-				if len(svc.ServiceAccounts) > 0 {
-					accounts = accounts.Copy().InsertAll(svc.ServiceAccounts...)
-				}
-				sa := sets.SortedList(spiffe.ExpandWithTrustDomains(accounts, ps.Mesh.TrustDomainAliases))
-				key := serviceAccountKey{
-					hostname:  svc.Hostname,
-					namespace: svc.Attributes.Namespace,
-					port:      port.Port,
-				}
-				ps.serviceAccounts[key] = sa
-			}()
+		var accounts sets.String
+		// First get endpoint level service accounts
+		shard, f := env.EndpointIndex.ShardsForService(string(svc.Hostname), svc.Attributes.Namespace)
+		if f {
+			shard.RLock()
+			// copy here to reduce the lock time
+			// endpoints could update frequently, so the longer it locks, the more likely it will block other threads.
+			accounts = shard.ServiceAccounts.Copy()
+			shard.RUnlock()
 		}
+		if len(svc.ServiceAccounts) > 0 {
+			if accounts == nil {
+				accounts = sets.New(svc.ServiceAccounts...)
+			} else {
+				accounts = accounts.InsertAll(svc.ServiceAccounts...)
+			}
+		}
+		sa := sets.SortedList(spiffe.ExpandWithTrustDomains(accounts, ps.Mesh.TrustDomainAliases))
+		key := serviceAccountKey{
+			hostname:  svc.Hostname,
+			namespace: svc.Attributes.Namespace,
+		}
+		ps.serviceAccounts[key] = sa
 	}
 }
 
@@ -1618,10 +1755,6 @@ func (ps *PushContext) initVirtualServices(env *Environment) {
 				for host := range virtualServiceDestinations(rule) {
 					sets.InsertOrNew(ps.virtualServiceIndex.destinationsByGateway, gw, host)
 				}
-				if _, exists := ps.virtualServiceIndex.destinationsByGateway[gw]; !exists {
-					ps.virtualServiceIndex.destinationsByGateway[gw] = sets.Set[string]{}
-				}
-				addHostsFromMeshConfig(ps, ps.virtualServiceIndex.destinationsByGateway[gw])
 			}
 		}
 
@@ -1804,7 +1937,7 @@ func (ps *PushContext) setDestinationRules(configs []config.Config) {
 		// We only honor . and *
 		if exportToSet.IsEmpty() && ps.exportToDefaults.destinationRule.Contains(visibility.Private) {
 			isPrivateOnly = true
-		} else if exportToSet.Len() == 1 && exportToSet.Contains(visibility.Private) || exportToSet.Contains(visibility.Instance(configs[i].Namespace)) {
+		} else if exportToSet.Len() == 1 && (exportToSet.Contains(visibility.Private) || exportToSet.Contains(visibility.Instance(configs[i].Namespace))) {
 			isPrivateOnly = true
 		}
 
@@ -2205,11 +2338,10 @@ func (ps *PushContext) ReferenceAllowed(kind config.GroupVersionKind, resourceNa
 	return false
 }
 
-func (ps *PushContext) ServiceAccounts(hostname host.Name, namespace string, port int) []string {
+func (ps *PushContext) ServiceAccounts(hostname host.Name, namespace string) []string {
 	return ps.serviceAccounts[serviceAccountKey{
 		hostname:  hostname,
 		namespace: namespace,
-		port:      port,
 	}]
 }
 

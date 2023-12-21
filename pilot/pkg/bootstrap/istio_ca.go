@@ -227,7 +227,7 @@ func detectSigningCABundle() (ca.SigningCAFileBundle, error) {
 	tlsSigningFile := path.Join(LocalCertDir.Get(), ca.TLSSecretCACertFile)
 
 	// looking for tls file format (tls.crt)
-	if _, err := os.Stat(tlsSigningFile); !os.IsNotExist(err) {
+	if _, err := os.Stat(tlsSigningFile); err == nil {
 		log.Info("Using kubernetes.io/tls secret type for signing ca files")
 		return ca.SigningCAFileBundle{
 			RootCertFile: path.Join(LocalCertDir.Get(), ca.TLSSecretRootCertFile),
@@ -238,11 +238,10 @@ func detectSigningCABundle() (ca.SigningCAFileBundle, error) {
 			SigningCertFile: tlsSigningFile,
 			SigningKeyFile:  path.Join(LocalCertDir.Get(), ca.TLSSecretCAPrivateKeyFile),
 		}, nil
-	} else if os.IsNotExist(err) {
-		// noop, file does not exist, move on
-	} else if err != nil {
+	} else if !os.IsNotExist(err) {
 		return ca.SigningCAFileBundle{}, err
 	}
+
 	log.Info("Using istiod file format for signing ca files")
 	// default ca file format
 	return ca.SigningCAFileBundle{
@@ -296,7 +295,6 @@ func (s *Server) loadCACerts(caOpts *caOptions, dir string) error {
 // newly introduced cacerts are intermediate CA which is generated
 // from cuurent root-cert.pem. Then it updates and keycertbundle
 // and generates new dns certs.
-// TODO(rveerama1): Add support for new ROOT-CA rotation also.
 func handleEvent(s *Server) {
 	log.Info("Update Istiod cacerts")
 
@@ -311,7 +309,6 @@ func handleEvent(s *Server) {
 		return
 	}
 	newCABundle, err = os.ReadFile(fileBundle.RootCertFile)
-
 	if err != nil {
 		log.Errorf("failed reading root-cert.pem: %v", err)
 		return
@@ -319,8 +316,20 @@ func handleEvent(s *Server) {
 
 	// Only updating intermediate CA is supported now
 	if !bytes.Equal(currentCABundle, newCABundle) {
-		log.Info("Updating new ROOT-CA not supported")
-		return
+		if !features.MultiRootMesh {
+			log.Warn("Multi root is disabled, updating new ROOT-CA not supported")
+			return
+		}
+
+		// in order to support root ca rotation, or we are removing the old ca,
+		// we need to make the new CA bundle contain both old and new CA certs
+		if bytes.Contains(currentCABundle, newCABundle) ||
+			bytes.Contains(newCABundle, currentCABundle) {
+			log.Info("Updating new ROOT-CA")
+		} else {
+			log.Warn("Updating new ROOT-CA not supported")
+			return
+		}
 	}
 
 	err = s.CA.GetCAKeyCertBundle().UpdateVerifiedKeyCertBundleFromFile(
@@ -334,7 +343,7 @@ func handleEvent(s *Server) {
 		return
 	}
 
-	err = s.updatePluggedinRootCertAndGenKeyCert()
+	err = s.updateRootCertAndGenKeyCert()
 	if err != nil {
 		log.Errorf("Failed generating plugged-in istiod key cert: %v", err)
 		return
@@ -423,11 +432,6 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to determine signing file format %v", err)
 	}
-	if _, err := os.Stat(fileBundle.RootCertFile); err != nil {
-		// In Citadel, normal self-signed doesn't use a root-cert.pem file for additional roots.
-		// In Istiod, it is possible to provide one via "cacerts" secret in both cases, for consistency.
-		fileBundle.RootCertFile = ""
-	}
 	if _, err := os.Stat(fileBundle.SigningKeyFile); err == nil {
 		detectedSigningCABundle = true
 		if _, err := os.Stat(path.Join(LocalCertDir.Get(), ca.IstioGenerated)); err == nil {
@@ -435,22 +439,24 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 		}
 	}
 
-	if !detectedSigningCABundle || (detectedSigningCABundle && istioGenerated) {
-		if detectedSigningCABundle && istioGenerated {
-			log.Infof("%s secret found is IstioGenerated, use it as the CA certificate", ca.CACertsSecret)
+	if !detectedSigningCABundle || (features.UseCacertsForSelfSignedCA && istioGenerated) {
+		if features.UseCacertsForSelfSignedCA && istioGenerated {
+			log.Infof("IstioGenerated %s secret found, use it as the CA certificate", ca.CACertsSecret)
 
-			// TODO(jaellio): Currently, istiod handles a "cacerts" secret with the "istio-generated" key the same way
-			// it handles the "istio-ca-secret" secret. Even though "cacerts" is file mounted, istiod will only watch the
-			// secret. If an "istio-ca-secret" exists in the control plane ns, it will be used instead of a "cacerts"
-			// secret with the "istio-generated" key.
-			// This will change in the future, and istiod will watch the file mount instead.
+			// TODO(jaellio): Currently, when the USE_CACERTS_FOR_SELF_SIGNED_CA flag is true istiod
+			// handles loading and updating the "cacerts" secret with the "istio-generated" key the
+			// same way it handles the "istio-ca-secret" secret. Isitod utilizes a secret watch instead
+			// of file watch to check for secret updates. This may change in the future, and istiod
+			// will watch the file mount instead.
 		}
 
-		// Either the secret is not mounted, or it is mounted but the "istio-generated" key is used.
+		// Either the secret is not mounted because it is named `istio-ca-secret`,
+		// or it is `cacerts` secret mounted with "istio-generated" key set.
 		caOpts, err = s.createSelfSignedCACertificateOptions(&fileBundle, opts)
 		if err != nil {
 			return nil, err
 		}
+		caOpts.OnRootCertUpdate = s.updateRootCertAndGenKeyCert
 	} else {
 		// The secret is mounted and the "istio-generated" key is not used.
 		log.Info("Use local CA certificate")
@@ -467,10 +473,6 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 		return nil, fmt.Errorf("failed to create an istiod CA: %v", err)
 	}
 
-	// TODO: provide an endpoint returning all the roots. SDS can only pull a single root in current impl.
-	// ca.go saves or uses the secret, but also writes to the configmap "istio-security", under caTLSRootCert
-	// rootCertRotatorChan channel accepts signals to stop root cert rotator for
-	// self-signed CA.
 	// Start root cert rotator in a separate goroutine.
 	istioCA.Run(s.internalStop)
 	return istioCA, nil
@@ -491,7 +493,7 @@ func (s *Server) createSelfSignedCACertificateOptions(fileBundle *ca.SigningCAFi
 		caOpts, err = ca.NewSelfSignedIstioCAOptions(ctx,
 			selfSignedRootCertGracePeriodPercentile.Get(), SelfSignedCACertTTL.Get(),
 			selfSignedRootCertCheckInterval.Get(), workloadCertTTL.Get(),
-			maxWorkloadCertTTL.Get(), opts.TrustDomain, true,
+			maxWorkloadCertTTL.Get(), opts.TrustDomain, features.UseCacertsForSelfSignedCA, true,
 			opts.Namespace, s.kubeClient.Kube().CoreV1(), fileBundle.RootCertFile,
 			enableJitterForRootCertRotator.Get(), caRSAKeySize.Get())
 	} else {

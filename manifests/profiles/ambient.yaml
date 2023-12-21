@@ -6,13 +6,6 @@ spec:
     defaultConfig:
       proxyMetadata:
         ISTIO_META_ENABLE_HBONE: "true"
-    # Telemetry API is used with ambient instead of EnvoyFilters
-    defaultProviders:
-      metrics:
-      - prometheus
-    extensionProviders:
-    - name: prometheus
-      prometheus: {}
 
   components:
     cni:
@@ -24,9 +17,10 @@ spec:
       enabled: false
 
   values:
-    global:
+    ztunnel:
       variant: distroless
     pilot:
+      variant: distroless
       env:
         # Setup more secure default that is off in 'default' only for backwards compatibility
         VERIFY_CERTIFICATE_AT_CLIENT: "true"
@@ -44,9 +38,3 @@ spec:
       # Default excludes istio-system; its actually fine to redirect there since we opt-out istiod, ztunnel, and istio-cni
       excludeNamespaces:
       - kube-system
-
-    telemetry:
-      # Telemetry handled with Telemetry API only
-      enabled: false
-      v2:
-        enabled: false

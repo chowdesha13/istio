@@ -402,14 +402,16 @@ func (f *FakeDiscoveryServer) ConnectUnstarted(p *model.Proxy, watch []string) *
 			return f.BufListener.Dial()
 		}))
 	}
-	adscConn, err := adsc.New(f.Listener.Addr().String(), &adsc.Config{
-		IP:                       p.IPAddresses[0],
-		NodeType:                 string(p.Type),
-		Meta:                     p.Metadata.ToStruct(),
-		Locality:                 p.Locality,
-		Namespace:                p.ConfigNamespace,
+	adscConn, err := adsc.New(f.Listener.Addr().String(), &adsc.ADSConfig{
+		Config: adsc.Config{
+			IP:        p.IPAddresses[0],
+			NodeType:  p.Type,
+			Meta:      p.Metadata.ToStruct(),
+			Locality:  p.Locality,
+			Namespace: p.ConfigNamespace,
+			GrpcOpts:  opts,
+		},
 		InitialDiscoveryRequests: initialWatch,
-		GrpcOpts:                 opts,
 	})
 	if err != nil {
 		f.t.Fatalf("Error connecting: %v", err)
@@ -501,7 +503,7 @@ func kubernetesObjectsFromString(s string) ([]runtime.Object, error) {
 		}
 		o, _, err := decode([]byte(s), nil, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed deserializing kubernetes object: %v", err)
+			return nil, fmt.Errorf("failed deserializing kubernetes object: %v (%v)", err, s)
 		}
 		objects = append(objects, o)
 	}

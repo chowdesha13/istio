@@ -42,6 +42,7 @@ import (
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/visibility"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
@@ -222,6 +223,9 @@ type Controller struct {
 	ambientIndex     AmbientIndex
 	configController model.ConfigStoreController
 	configCluster    bool
+
+	networksHandlerRegistration *mesh.WatcherHandlerRegistration
+	meshHandlerRegistration     *mesh.WatcherHandlerRegistration
 }
 
 // NewController creates a new Kubernetes controller
@@ -263,7 +267,7 @@ func NewController(kubeClient kubelib.Client, options Options) *Controller {
 	if !c.opts.ConfigCluster || c.opts.DiscoveryNamespacesFilter == nil {
 		c.opts.DiscoveryNamespacesFilter = namespace.NewDiscoveryNamespacesFilter(c.namespaces, options.MeshWatcher.Mesh().DiscoverySelectors)
 	}
-	c.initDiscoveryHandlers(options.MeshWatcher, c.opts.DiscoveryNamespacesFilter)
+	c.initDiscoveryHandlers(c.opts.MeshWatcher, c.opts.DiscoveryNamespacesFilter)
 
 	c.services = kclient.NewFiltered[*v1.Service](kubeClient, kclient.Filter{ObjectFilter: c.opts.DiscoveryNamespacesFilter.Filter})
 
@@ -281,7 +285,7 @@ func NewController(kubeClient kubelib.Client, options Options) *Controller {
 	})
 	c.pods = newPodCache(c, c.podsClient, func(key types.NamespacedName) {
 		c.queue.Push(func() error {
-			return c.endpoints.sync(key.Name, key.Namespace, model.EventAdd, true)
+			return c.endpoints.podArrived(key.Name, key.Namespace)
 		})
 	})
 	registerHandlers[*v1.Pod](c, c.podsClient, "Pods", c.pods.onEvent, c.pods.labelFilter)
@@ -295,13 +299,12 @@ func NewController(kubeClient kubelib.Client, options Options) *Controller {
 
 	c.meshWatcher = options.MeshWatcher
 	if c.opts.MeshNetworksWatcher != nil {
-		c.opts.MeshNetworksWatcher.AddNetworksHandler(func() {
+		c.networksHandlerRegistration = c.opts.MeshNetworksWatcher.AddNetworksHandler(func() {
 			c.reloadMeshNetworks()
 			c.onNetworkChange()
 		})
 		c.reloadMeshNetworks()
 	}
-
 	return c
 }
 
@@ -367,6 +370,17 @@ func (c *Controller) Cleanup() error {
 	if c.opts.XDSUpdater != nil {
 		c.opts.XDSUpdater.RemoveShard(model.ShardKeyFromRegistry(c))
 	}
+
+	// Unregister networks handler
+	if c.networksHandlerRegistration != nil {
+		c.opts.MeshNetworksWatcher.DeleteNetworksHandler(c.networksHandlerRegistration)
+	}
+
+	// Unregister mesh handler
+	if c.meshHandlerRegistration != nil {
+		c.opts.MeshWatcher.DeleteMeshHandler(c.meshHandlerRegistration)
+	}
+
 	return nil
 }
 
@@ -426,7 +440,7 @@ func (c *Controller) addOrUpdateService(curr *v1.Service, currConv *model.Servic
 	}
 
 	// For ExternalName, we need to update the EndpointIndex, as we will store endpoints just based on the Service.
-	if curr != nil && curr.Spec.Type == v1.ServiceTypeExternalName {
+	if !features.EnableExternalNameAlias && curr != nil && curr.Spec.Type == v1.ServiceTypeExternalName {
 		updateEDSCache = true
 	}
 
@@ -468,7 +482,9 @@ func (c *Controller) buildEndpointsForService(svc *model.Service, updateCache bo
 		fep := c.collectWorkloadInstanceEndpoints(svc)
 		endpoints = append(endpoints, fep...)
 	}
-	endpoints = append(endpoints, kube.ExternalNameEndpoints(svc)...)
+	if !features.EnableExternalNameAlias {
+		endpoints = append(endpoints, kube.ExternalNameEndpoints(svc)...)
+	}
 	return endpoints
 }
 
@@ -901,7 +917,7 @@ func (c *Controller) workloadInstanceHandler(si *model.WorkloadInstance, event m
 	matchedHostnames := slices.Map(matchedServices, func(e *v1.Service) host.Name {
 		return kube.ServiceHostname(e.Name, e.Namespace, c.opts.DomainSuffix)
 	})
-	c.endpoints.updateEDS(matchedHostnames, si.Namespace)
+	c.endpoints.pushEDS(matchedHostnames, si.Namespace)
 }
 
 func (c *Controller) onSystemNamespaceEvent(_, ns *v1.Namespace, ev model.Event) error {
@@ -1140,7 +1156,12 @@ func serviceUpdateNeedsPush(prev, curr *model.Service) bool {
 		return true
 	}
 	if prev == nil {
-		return true
+		return !curr.Attributes.ExportTo.Contains(visibility.None)
+	}
+	// if service are not exported, no need to push
+	if prev.Attributes.ExportTo.Contains(visibility.None) &&
+		curr.Attributes.ExportTo.Contains(visibility.None) {
+		return false
 	}
 	return !prev.Equals(curr)
 }

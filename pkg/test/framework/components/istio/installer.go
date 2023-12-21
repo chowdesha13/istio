@@ -79,6 +79,9 @@ func (i *installer) Install(c cluster.Cluster, args installArgs) error {
 	if i.ctx.Settings().Ambient {
 		iArgs.InFilenames = append(iArgs.InFilenames, filepath.Join(testenv.IstioSrc, IntegrationTestAmbientDefaultsIOP))
 	}
+	if i.ctx.Settings().PeerMetadataDiscovery && len(args.ComponentName) == 0 {
+		iArgs.InFilenames = append(iArgs.InFilenames, filepath.Join(testenv.IstioSrc, IntegrationTestPeerMetadataDiscoveryDefaultsIOP))
+	}
 
 	rc, err := kube.DefaultRestConfig(kubeConfigFile, "", func(config *rest.Config) {
 		config.QPS = 50
@@ -94,7 +97,6 @@ func (i *installer) Install(c cluster.Cluster, args installArgs) error {
 
 	// Generate the manifest YAML, so that we can uninstall it in Close.
 	var stdOut, stdErr bytes.Buffer
-	fmt.Println("INFILES: ", iArgs.InFilenames)
 	if err := mesh.ManifestGenerate(kubeClient, &mesh.RootArgs{}, &mesh.ManifestGenerateArgs{
 		InFilenames:   iArgs.InFilenames,
 		Set:           iArgs.Set,

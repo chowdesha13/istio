@@ -73,6 +73,8 @@ autoscaling:
   minReplicas: 1
   maxReplicas: 5
   targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: {}
+  autoscaleBehavior: {}
 
 # Pod environment variables
 env: {}
@@ -139,3 +141,9 @@ volumes: []
 # A list of `VolumeMounts` added into the Gateway Pods. See
 # https://kubernetes.io/docs/concepts/storage/volumes/.
 volumeMounts: []
+
+# Configure this to a higher priority class in order to make sure your Istio gateway pods
+# will not be killed because of low priority class.
+# Refer to https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/#priorityclass
+# for more detail.
+priorityClassName: ""

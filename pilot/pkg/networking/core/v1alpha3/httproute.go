@@ -25,7 +25,7 @@ import (
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	anypb "github.com/golang/protobuf/ptypes/any"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -388,6 +388,10 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 
 	servicesByName := make(map[host.Name]*model.Service)
 	for _, svc := range services {
+		if svc.Resolution == model.Alias {
+			// Will be handled by the service it is an alias for
+			continue
+		}
 		if listenerPort == 0 {
 			// Take all ports when listen port is 0 (http_proxy or uds)
 			// Expect virtualServices to resolve to right port
@@ -403,6 +407,8 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 					Namespace:       svc.Attributes.Namespace,
 					ServiceRegistry: svc.Attributes.ServiceRegistry,
 					Labels:          svc.Attributes.Labels,
+					Aliases:         svc.Attributes.Aliases,
+					K8sAttributes:   svc.Attributes.K8sAttributes,
 				},
 			}
 			if features.EnableDualStack {
@@ -443,8 +449,12 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 		// only select virtualServices that matches a service
 		virtualServices = selectVirtualServices(virtualServices, servicesByName)
 	}
+
+	mostSpecificWildcardIndex := egressListener.MostSpecificWildcardServiceIndex()
 	// Get list of virtual services bound to the mesh gateway
-	virtualHostWrappers := istio_route.BuildSidecarVirtualHostWrapper(routeCache, node, push, servicesByName, virtualServices, listenerPort)
+	virtualHostWrappers := istio_route.BuildSidecarVirtualHostWrapper(routeCache, node, push,
+		servicesByName, virtualServices, listenerPort, mostSpecificWildcardIndex,
+	)
 
 	if features.EnableRDSCaching {
 		resource := xdsCache.Get(routeCache)
@@ -495,21 +505,21 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 			push.AddMetric(model.DuplicatedDomains, name, node.ID, msg)
 		}
 		if len(domains) > 0 {
-			perRouteFilters := map[string]*anypb.Any{}
+			pervirtualHostFilters := map[string]*anypb.Any{}
 			if statefulConfig := util.MaybeBuildStatefulSessionFilterConfig(svc); statefulConfig != nil {
 				perRouteStatefulSession := &statefulsession.StatefulSessionPerRoute{
 					Override: &statefulsession.StatefulSessionPerRoute_StatefulSession{
 						StatefulSession: statefulConfig,
 					},
 				}
-				perRouteFilters[util.StatefulSessionFilter] = protoconv.MessageToAny(perRouteStatefulSession)
+				pervirtualHostFilters[util.StatefulSessionFilter] = protoconv.MessageToAny(perRouteStatefulSession)
 			}
 			return &route.VirtualHost{
 				Name:                       name,
 				Domains:                    domains,
 				Routes:                     vhwrapper.Routes,
 				IncludeRequestAttemptCount: includeRequestAttemptCount,
-				TypedPerFilterConfig:       perRouteFilters,
+				TypedPerFilterConfig:       pervirtualHostFilters,
 			}
 		}
 
@@ -614,10 +624,18 @@ func generateVirtualHostDomains(service *model.Service, listenerPort int, port i
 		// Indicate we do not need port, as we will set IgnorePortInHostMatching
 		port = portNoAppendPortSuffix
 	}
-	altHosts := GenerateAltVirtualHosts(string(service.Hostname), port, node.DNSDomain)
-	domains := make([]string, 0, 4+len(altHosts))
-	domains = appendDomainPort(domains, string(service.Hostname), port)
-	domains = append(domains, altHosts...)
+	domains := []string{}
+	allAltHosts := []string{}
+	all := []string{string(service.Hostname)}
+	for _, a := range service.Attributes.Aliases {
+		all = append(all, a.Hostname.String())
+	}
+	for _, s := range all {
+		altHosts := GenerateAltVirtualHosts(s, port, node.DNSDomain)
+		domains = appendDomainPort(domains, s, port)
+		domains = append(domains, altHosts...)
+		allAltHosts = append(allAltHosts, altHosts...)
+	}
 
 	if service.Resolution == model.Passthrough &&
 		service.Attributes.ServiceRegistry == provider.Kubernetes {
@@ -638,7 +656,7 @@ func generateVirtualHostDomains(service *model.Service, listenerPort int, port i
 		domains = appendDomainPort(domains, addr, port)
 	}
 
-	return domains, altHosts
+	return domains, allAltHosts
 }
 
 // appendDomainPort appends `domain` and `domain:port` to `domains`. The `domain:port` variant is skipped

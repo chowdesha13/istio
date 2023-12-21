@@ -110,7 +110,7 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 
 	builder.patchListeners()
 	l := builder.getListeners()
-	if builder.node.EnableHBONE() && !builder.node.IsAmbient() {
+	if builder.node.EnableHBONE() && !builder.node.IsWaypointProxy() {
 		l = append(l, buildConnectOriginateListener())
 	}
 
@@ -126,7 +126,11 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 	} else if transportProtocol == istionetworking.TransportProtocolTCP &&
 		serverTLSSettings.Mode == networking.ServerTLSSettings_ISTIO_MUTUAL &&
 		gatewayTCPServerWithTerminatingTLS {
-		alpnByTransport = util.ALPNDownstreamWithMxc
+		if features.DisableMxALPN {
+			alpnByTransport = util.ALPNDownstream
+		} else {
+			alpnByTransport = util.ALPNDownstreamWithMxc
+		}
 	}
 
 	ctx := &auth.DownstreamTlsContext{
@@ -766,6 +770,10 @@ func buildSidecarOutboundTCPListenerOpts(opts outboundListenerOpts, virtualServi
 func (lb *ListenerBuilder) buildSidecarOutboundListener(listenerOpts outboundListenerOpts,
 	listenerMap map[listenerKey]*outboundListenerEntry, virtualServices []config.Config, actualWildcards []string,
 ) {
+	// Alias services do not get listeners generated
+	if listenerOpts.service.Resolution == model.Alias {
+		return
+	}
 	// TODO: remove actualWildcard
 	var currentListenerEntry *outboundListenerEntry
 
@@ -1091,64 +1099,56 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		})
 	}
 
-	var res *listener.Listener
+	res := &listener.Listener{
+		TrafficDirection: core.TrafficDirection_OUTBOUND,
+		ListenerFilters:  listenerFilters,
+		FilterChains:     filterChains,
+		// For Gateways, we want no timeout. We should wait indefinitely for the TLS if we are sniffing.
+		// The timeout is useful for sidecars, where we may operate on server first traffic; for gateways if we have listener filters
+		// we know those filters are required.
+		ContinueOnListenerFiltersTimeout: false,
+		ListenerFiltersTimeout:           durationpb.New(0),
+	}
 	switch transport {
 	case istionetworking.TransportProtocolTCP:
-		var connectionBalance *listener.Listener_ConnectionBalanceConfig
+		// TODO: need to sanitize the opts.bind if its a UDS socket, as it could have colons, that envoy doesn't like
+		res.Name = getListenerName(opts.bind, opts.port, istionetworking.TransportProtocolTCP)
+		log.Debugf("buildGatewayListener: building TCP listener %s", res.Name)
+		// TODO: need to sanitize the opts.bind if its a UDS socket, as it could have colons, that envoy doesn't like
+		res.Address = util.BuildAddress(opts.bind, uint32(opts.port))
 		// only use to exact_balance for tcp outbound listeners; virtualOutbound listener should
 		// not have this set per Envoy docs for redirected listeners
 		if opts.proxy.Metadata.OutboundListenerExactBalance {
-			connectionBalance = &listener.Listener_ConnectionBalanceConfig{
+			res.ConnectionBalanceConfig = &listener.Listener_ConnectionBalanceConfig{
 				BalanceType: &listener.Listener_ConnectionBalanceConfig_ExactBalance_{
 					ExactBalance: &listener.Listener_ConnectionBalanceConfig_ExactBalance{},
 				},
 			}
 		}
-
-		res = &listener.Listener{
-			// TODO: need to sanitize the opts.bind if its a UDS socket, as it could have colons, that envoy doesn't like
-			Name:                             getListenerName(opts.bind, opts.port, istionetworking.TransportProtocolTCP),
-			Address:                          util.BuildAddress(opts.bind, uint32(opts.port)),
-			TrafficDirection:                 core.TrafficDirection_OUTBOUND,
-			ListenerFilters:                  listenerFilters,
-			FilterChains:                     filterChains,
-			ConnectionBalanceConfig:          connectionBalance,
-			ContinueOnListenerFiltersTimeout: true,
-		}
-		// add extra addresses for the listener
-		if features.EnableDualStack && len(opts.extraBind) > 0 {
-			res.AdditionalAddresses = util.BuildAdditionalAddresses(opts.extraBind, uint32(opts.port))
-		}
-
-		if opts.proxy.Type != model.Router {
-			res.ListenerFiltersTimeout = opts.push.Mesh.ProtocolDetectionTimeout
-		}
 	case istionetworking.TransportProtocolQUIC:
 		// TODO: switch on TransportProtocolQUIC is in too many places now. Once this is a bit
 		//       mature, refactor some of these to an interface so that they kick off the process
 		//       of building listener, filter chains, serializing etc based on transport protocol
-		listenerName := getListenerName(opts.bind, opts.port, istionetworking.TransportProtocolQUIC)
-		log.Debugf("buildGatewayListener: building UDP/QUIC listener %s", listenerName)
-		res = &listener.Listener{
-			Name:             listenerName,
-			Address:          util.BuildNetworkAddress(opts.bind, uint32(opts.port), istionetworking.TransportProtocolQUIC),
-			TrafficDirection: core.TrafficDirection_OUTBOUND,
-			FilterChains:     filterChains,
-			UdpListenerConfig: &listener.UdpListenerConfig{
-				// TODO: Maybe we should add options in MeshConfig to
-				//       configure QUIC options - it should look similar
-				//       to the H2 protocol options.
-				QuicOptions:            &listener.QuicProtocolOptions{},
-				DownstreamSocketConfig: &core.UdpSocketConfig{},
-			},
-			ContinueOnListenerFiltersTimeout: true,
+		res.Name = getListenerName(opts.bind, opts.port, istionetworking.TransportProtocolQUIC)
+		log.Debugf("buildGatewayListener: building UDP/QUIC listener %s", res.Name)
+		res.Address = util.BuildNetworkAddress(opts.bind, uint32(opts.port), istionetworking.TransportProtocolQUIC)
+		res.UdpListenerConfig = &listener.UdpListenerConfig{
+			// TODO: Maybe we should add options in MeshConfig to
+			//       configure QUIC options - it should look similar
+			//       to the H2 protocol options.
+			QuicOptions:            &listener.QuicProtocolOptions{},
+			DownstreamSocketConfig: &core.UdpSocketConfig{},
 		}
-		// add extra addresses for the listener
-		if features.EnableDualStack && len(opts.extraBind) > 0 {
-			res.AdditionalAddresses = util.BuildAdditionalAddresses(opts.extraBind, uint32(opts.port))
+
+	}
+	// add extra addresses for the listener
+	if features.EnableDualStack && len(opts.extraBind) > 0 {
+		res.AdditionalAddresses = util.BuildAdditionalAddresses(opts.extraBind, uint32(opts.port))
+		// Ensure consistent transport protocol with main address
+		for _, additionalAddress := range res.AdditionalAddresses {
+			additionalAddress.GetAddress().GetSocketAddress().Protocol = transport.ToEnvoySocketProtocol()
 		}
 	}
-
 	accessLogBuilder.setListenerAccessLog(opts.push, opts.proxy, res, istionetworking.ListenerClassGateway)
 
 	return res

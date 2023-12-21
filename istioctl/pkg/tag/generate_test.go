@@ -15,6 +15,7 @@
 package tag
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -27,6 +28,7 @@ import (
 	"istio.io/api/label"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/test/env"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 var (
@@ -186,7 +188,10 @@ func TestGenerateValidatingWebhook(t *testing.T) {
 			if err != nil {
 				t.Fatalf("webhook fixing failed with error: %v", err)
 			}
-			webhookYAML, err := generateValidatingWebhook(webhookConfig, filepath.Join(env.IstioSrc, "manifests"), nil)
+			opts := &GenerateOptions{
+				ManifestsPath: filepath.Join(env.IstioSrc, "manifests"),
+			}
+			webhookYAML, err := generateValidatingWebhook(webhookConfig, opts)
 			if err != nil {
 				t.Fatalf("tag webhook YAML generation failed with error: %v", err)
 			}
@@ -345,4 +350,38 @@ func TestGenerateMutatingWebhook(t *testing.T) {
 			}
 		}
 	}
+}
+
+func testGenerateOption(t *testing.T, generate bool, assertFunc func(*testing.T, []admitv1.MutatingWebhook, []admitv1.MutatingWebhook)) {
+	defaultWh := defaultRevisionCanonicalWebhook.DeepCopy()
+	fakeClient := kube.NewFakeClient(defaultWh)
+
+	opts := &GenerateOptions{
+		Generate: generate,
+		Tag:      "default",
+		Revision: "default",
+	}
+
+	_, err := Generate(context.TODO(), fakeClient, opts, "istio-system")
+	assert.NoError(t, err)
+
+	wh, err := fakeClient.Kube().AdmissionregistrationV1().MutatingWebhookConfigurations().
+		Get(context.Background(), "istio-sidecar-injector", metav1.GetOptions{})
+	assert.NoError(t, err)
+
+	assertFunc(t, wh.Webhooks, defaultWh.Webhooks)
+}
+
+func TestGenerateOptions(t *testing.T) {
+	// Test generate option 'true', should not modify webhooks
+	testGenerateOption(t, true, func(t *testing.T, actual, expected []admitv1.MutatingWebhook) {
+		assert.Equal(t, actual, expected)
+	})
+
+	// Test generate option 'false', should modify webhooks
+	testGenerateOption(t, false, func(t *testing.T, actual, expected []admitv1.MutatingWebhook) {
+		if err := assert.Compare(actual, expected); err == nil {
+			t.Errorf("expected diff between webhooks, got none")
+		}
+	})
 }

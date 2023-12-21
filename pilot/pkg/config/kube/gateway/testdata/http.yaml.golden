@@ -2,6 +2,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: Gateway
 metadata:
   annotations:
+    internal.istio.io/gateway-semantics: gateway
     internal.istio.io/gateway-service: istio-ingressgateway.istio-system.svc.domain.suffix
     internal.istio.io/parents: Gateway/gateway/default.istio-system
   creationTimestamp: null
@@ -197,6 +198,17 @@ spec:
   http:
   - match:
     - uri:
+        prefix: /prefix-to-be-removed
+    name: default.rewrite.1
+    rewrite:
+      uri: /
+    route:
+    - destination:
+        host: httpbin.default.svc.domain.suffix
+        port:
+          number: 80
+  - match:
+    - uri:
         prefix: /prefix-original
     name: default.rewrite.0
     rewrite:
@@ -210,7 +222,7 @@ spec:
   - match:
     - uri:
         prefix: /full-original
-    name: default.rewrite.1
+    name: default.rewrite.2
     rewrite:
       authority: new.example.com
       uriRegexRewrite:

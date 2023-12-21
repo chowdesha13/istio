@@ -35,6 +35,7 @@ import (
 	"istio.io/istio/pilot/cmd/pilot-agent/config"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
 	"istio.io/istio/pilot/pkg/model"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/backoff"
 	"istio.io/istio/pkg/bootstrap"
 	"istio.io/istio/pkg/bootstrap/platform"
@@ -78,6 +79,13 @@ const (
 )
 
 var _ ready.Prober = &Agent{}
+
+type LifecycleEvent string
+
+const (
+	DrainLifecycleEvent LifecycleEvent = "drain"
+	ExitLifecycleEvent  LifecycleEvent = "exit"
+)
 
 // Agent contains the configuration of the agent, based on the injected
 // environment:
@@ -191,6 +199,9 @@ type AgentOptions struct {
 	DualStack bool
 
 	UseExternalWorkloadSDS bool
+
+	// Enable metadata discovery bootstrap extension
+	MetadataDiscovery bool
 }
 
 // NewAgent hosts the functionality for local SDS and XDS. This consists of the local SDS server and
@@ -245,6 +256,7 @@ func (a *Agent) generateNodeMetadata() (*model.Node, error) {
 		EnvoyStatusPort:             a.cfg.EnvoyStatusPort,
 		ExitOnZeroActiveConnections: a.cfg.ExitOnZeroActiveConnections,
 		XDSRootCert:                 a.cfg.XDSRootCerts,
+		MetadataDiscovery:           a.cfg.MetadataDiscovery,
 	})
 }
 
@@ -309,6 +321,7 @@ func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
 				errCh:       a.dynamicBootstrapWaitCh,
 				envoyUpdate: envoyProxy.UpdateConfig,
 			}
+			a.xdsProxy.handlers[v3.BootstrapType] = bsStream.bootStrapHandler
 			err := a.xdsProxy.handleStream(bsStream)
 			if err != nil {
 				log.Warn(err)
@@ -838,4 +851,8 @@ func (a *Agent) newSecretManager() (*cache.SecretManagerClient, error) {
 // GRPCBootstrapPath returns the most recently generated gRPC bootstrap or nil if there is none.
 func (a *Agent) GRPCBootstrapPath() string {
 	return a.cfg.GRPCBootstrapPath
+}
+
+func (a *Agent) DrainNow() {
+	a.envoyAgent.DrainNow()
 }

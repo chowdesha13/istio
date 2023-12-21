@@ -46,6 +46,8 @@ var rbacPolicyMatchNever = &rbacpb.Policy{
 // General setting to control behavior
 type Option struct {
 	IsCustomBuilder bool
+	UseFilterState  bool
+	UseExtendedJwt  bool
 }
 
 // Builder builds Istio authorization policy to Envoy filters.
@@ -217,7 +219,7 @@ func (b Builder) build(policies []model.AuthorizationPolicy, action rbacpb.RBAC_
 				b.logger.AppendError(fmt.Errorf("skipped nil rule %s", name))
 				continue
 			}
-			m, err := authzmodel.New(rule)
+			m, err := authzmodel.New(rule, b.option.UseExtendedJwt)
 			if err != nil {
 				b.logger.AppendError(multierror.Prefix(err, fmt.Sprintf("skipped invalid rule %s:", name)))
 				continue
@@ -226,7 +228,7 @@ func (b Builder) build(policies []model.AuthorizationPolicy, action rbacpb.RBAC_
 			if len(b.trustDomainBundle.TrustDomains) > 1 {
 				b.logger.AppendDebugf("patched source principal with trust domain aliases %v", b.trustDomainBundle.TrustDomains)
 			}
-			generated, err := m.Generate(forTCP, false, action)
+			generated, err := m.Generate(forTCP, !b.option.UseFilterState, action)
 			if err != nil {
 				b.logger.AppendDebugf("skipped rule %s on TCP filter chain: %v", name, err)
 				continue
@@ -319,7 +321,8 @@ func (b Builder) buildTCP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, provider
 		}
 	}
 
-	if extauthz, err := getExtAuthz(b.extensions, providers); err != nil {
+	extauthz, err := getExtAuthz(b.extensions, providers)
+	if err != nil {
 		b.logger.AppendError(multierror.Prefix(err, "failed to process CUSTOM action, will generate deny configs for the specified rules:"))
 		rbac := &rbactcp.RBAC{
 			Rules:      getBadCustomDenyRules(rules),
@@ -334,22 +337,22 @@ func (b Builder) buildTCP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, provider
 	} else if extauthz.tcp == nil {
 		b.logger.AppendDebugf("ignored CUSTOM action with HTTP provider on TCP filter chain")
 		return nil
-	} else {
-		rbac := &rbactcp.RBAC{
-			ShadowRules:           rules,
-			StatPrefix:            authzmodel.RBACTCPFilterStatPrefix,
-			ShadowRulesStatPrefix: authzmodel.RBACExtAuthzShadowRulesStatPrefix,
-		}
-		return []*listener.Filter{
-			{
-				Name:       wellknown.RoleBasedAccessControl,
-				ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(rbac)},
-			},
-			{
-				Name:       wellknown.ExternalAuthorization,
-				ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(extauthz.tcp)},
-			},
-		}
+	}
+
+	rbac := &rbactcp.RBAC{
+		ShadowRules:           rules,
+		StatPrefix:            authzmodel.RBACTCPFilterStatPrefix,
+		ShadowRulesStatPrefix: authzmodel.RBACExtAuthzShadowRulesStatPrefix,
+	}
+	return []*listener.Filter{
+		{
+			Name:       wellknown.RoleBasedAccessControl,
+			ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(rbac)},
+		},
+		{
+			Name:       wellknown.ExternalAuthorization,
+			ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(extauthz.tcp)},
+		},
 	}
 }
 

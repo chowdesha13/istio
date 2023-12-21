@@ -237,8 +237,8 @@ func TestClient(t *testing.T) {
 	// We should not see obj3, it is filtered
 
 	deploys := tester.List(obj1.Namespace, klabels.Everything())
-	slices.SortFunc(deploys, func(a, b *appsv1.Deployment) bool {
-		return a.Name < b.Name
+	slices.SortBy(deploys, func(a *appsv1.Deployment) string {
+		return a.Name
 	})
 	assert.Equal(t, deploys, []*appsv1.Deployment{obj1, obj2})
 	assert.Equal(t, tester.Get(obj3.Name, obj3.Namespace), nil)
@@ -246,8 +246,7 @@ func TestClient(t *testing.T) {
 	tester.Delete(obj3.Name, obj3.Namespace)
 	tester.Delete(obj2.Name, obj2.Namespace)
 	tester.Delete(obj1.Name, obj1.Namespace)
-	tracker.WaitOrdered("delete/2")
-	tracker.WaitOrdered("delete/1")
+	tracker.WaitOrdered("delete/2", "delete/1")
 	assert.Equal(t, tester.List(obj1.Namespace, klabels.Everything()), nil)
 
 	// Create some more objects again

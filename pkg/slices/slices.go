@@ -16,8 +16,11 @@
 package slices
 
 import (
+	"cmp"
+	"slices" // nolint: depguard
+	"strings"
+
 	"golang.org/x/exp/constraints"
-	"golang.org/x/exp/slices"
 )
 
 // Equal reports whether two slices are equal: the same length and all
@@ -41,11 +44,23 @@ func EqualFunc[E1, E2 comparable](s1 []E1, s2 []E2, eq func(E1, E2) bool) bool {
 // SortFunc sorts the slice x in ascending order as determined by the less function.
 // This sort is not guaranteed to be stable.
 // The slice is modified in place but returned.
-func SortFunc[E any](x []E, less func(a, b E) bool) []E {
+func SortFunc[E any](x []E, less func(a, b E) int) []E {
 	if len(x) <= 1 {
 		return x
 	}
 	slices.SortFunc(x, less)
+	return x
+}
+
+// SortBy is a helper to sort a slice by some value. Typically, this would be sorting a struct
+// by a single field. If you need to have multiple fields, see the ExampleSort.
+func SortBy[E any, A constraints.Ordered](x []E, extract func(a E) A) []E {
+	if len(x) <= 1 {
+		return x
+	}
+	SortFunc(x, func(a, b E) int {
+		return cmp.Compare(extract(a), extract(b))
+	})
 	return x
 }
 
@@ -107,6 +122,14 @@ func FilterInPlace[E any](s []E, f func(E) bool) []E {
 			n++
 		}
 	}
+
+	// If those elements contain pointers you might consider zeroing those elements
+	// so that objects they reference can be garbage collected."
+	var empty E
+	for i := n; i < len(s); i++ {
+		s[i] = empty
+	}
+
 	s = s[:n]
 	return s
 }
@@ -171,4 +194,27 @@ func Flatten[E any](s [][]E) []E {
 		res = append(res, v...)
 	}
 	return res
+}
+
+// Group groups a slice by a key.
+func Group[T any, K comparable](data []T, f func(T) K) map[K][]T {
+	res := make(map[K][]T, len(data))
+	for _, e := range data {
+		k := f(e)
+		res[k] = append(res[k], e)
+	}
+	return res
+}
+
+// GroupUnique groups a slice by a key. Each key must be unique or data will be lost. To allow multiple use Group.
+func GroupUnique[T any, K comparable](data []T, f func(T) K) map[K]T {
+	res := make(map[K]T, len(data))
+	for _, e := range data {
+		res[f(e)] = e
+	}
+	return res
+}
+
+func Join(sep string, fields ...string) string {
+	return strings.Join(fields, sep)
 }

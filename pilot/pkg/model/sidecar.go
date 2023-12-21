@@ -31,6 +31,7 @@ import (
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -61,6 +62,28 @@ var (
 type hostClassification struct {
 	exactHosts sets.Set[host.Name]
 	allHosts   []host.Name
+}
+
+func (hc hostClassification) Matches(h host.Name) bool {
+	// exact lookup is fast, so check that first
+	if hc.exactHosts.Contains(h) {
+		return true
+	}
+
+	// exactHosts not found, fallback to loop allHosts
+	hIsWildCarded := h.IsWildCarded()
+	for _, importedHost := range hc.allHosts {
+		// If both are exact hosts, then fallback is not needed.
+		// In this scenario it should be determined by exact lookup.
+		if !hIsWildCarded && !importedHost.IsWildCarded() {
+			continue
+		}
+		// Check if the hostnames match per usual hostname matching rules
+		if h.SubsetOf(importedHost) {
+			return true
+		}
+	}
+	return false
 }
 
 // SidecarScope is a wrapper over the Sidecar resource with some
@@ -158,6 +181,9 @@ type IstioEgressListenerWrapper struct {
 	// nil if this is for the default sidecar scope.
 	IstioListener *networking.IstioEgressListener
 
+	// Specifies whether matching ports is required.
+	matchPort bool
+
 	// List of services imported by this egress listener above.
 	// This will be used by LDS and RDS code when
 	// building the set of virtual hosts or the tcp filterchain matches for
@@ -179,6 +205,11 @@ type IstioEgressListenerWrapper struct {
 	// a private virtual service for serviceA from the local namespace,
 	// with a different path rewrite or no path rewrites.
 	virtualServices []config.Config
+
+	// An index of hostname to the namespaced name of the VirtualService containing the most
+	// relevant host match. Depending on the `PERSIST_OLDEST_FIRST_HEURISTIC_FOR_VIRTUAL_SERVICE_HOST_MATCHING`
+	// feature flag, it could be the most specific host match or the oldest host match.
+	mostSpecificWildcardVsIndex map[host.Name]types.NamespacedName
 }
 
 const defaultSidecar = "default-sidecar"
@@ -192,8 +223,11 @@ func DefaultSidecarScopeForNamespace(ps *PushContext, configNamespace string) *S
 			Hosts: []string{"*/*"},
 		},
 	}
+	// TODO: merge services like sidecar specified using `addService`
 	defaultEgressListener.services = ps.servicesExportedToNamespace(configNamespace)
 	defaultEgressListener.virtualServices = ps.VirtualServicesForGateway(configNamespace, constants.IstioMeshGateway)
+	defaultEgressListener.mostSpecificWildcardVsIndex = computeWildcardHostVirtualServiceIndex(
+		defaultEgressListener.virtualServices, defaultEgressListener.services)
 
 	out := &SidecarScope{
 		Name:                    defaultSidecar,
@@ -217,9 +251,10 @@ func DefaultSidecarScopeForNamespace(ps *PushContext, configNamespace string) *S
 		// newly created Services cannot take ownership unexpectedly.
 		// However, the Service is from Kubernetes it should take precedence over ones not. This prevents someone from
 		// "domain squatting" on the hostname before a Kubernetes Service is created.
-		// This relies on the assumption that
 		if existing, f := out.servicesByHostname[s.Hostname]; f &&
 			!(existing.Attributes.ServiceRegistry != provider.Kubernetes && s.Attributes.ServiceRegistry == provider.Kubernetes) {
+			log.Debugf("Service %s/%s from registry %s ignored by %s/%s/%s", s.Attributes.Namespace, s.Hostname, s.Attributes.ServiceRegistry,
+				existing.Attributes.ServiceRegistry, existing.Attributes.Namespace, existing.Hostname)
 			continue
 		}
 		out.servicesByHostname[s.Hostname] = s
@@ -334,6 +369,7 @@ func initSidecarScopeInternalIndexes(ps *PushContext, sidecarScope *SidecarScope
 			sidecarScope.services = append(sidecarScope.services, s)
 			servicesAdded[s.Hostname] = serviceIndex{s, len(sidecarScope.services) - 1}
 		} else if foundSvc.svc.Attributes.Namespace == s.Attributes.Namespace && len(s.Ports) > 0 {
+			// TODO: we should not merge k8s service with non k8s service.
 			// merge the ports to service when each listener generates partial service
 			// we only merge if the found service is in the same namespace as the one we're trying to add
 			copied := foundSvc.svc.DeepCopy()
@@ -368,7 +404,6 @@ func initSidecarScopeInternalIndexes(ps *PushContext, sidecarScope *SidecarScope
 			sidecarScope.AddConfigDependencies(delegate)
 		}
 
-		matchPort := needsPortMatch(listener)
 		// Infer more possible destinations from virtual services
 		// Services chosen here will not override services explicitly requested in listener.services.
 		// That way, if there is ambiguity around what hostname to pick, a user can specify the one they
@@ -384,7 +419,7 @@ func initSidecarScopeInternalIndexes(ps *PushContext, sidecarScope *SidecarScope
 				if s, ok := ps.ServiceIndex.HostnameAndNamespace[host.Name(h)][configNamespace]; ok {
 					// This won't overwrite hostnames that have already been found eg because they were requested in hosts
 					var vss *Service
-					if matchPort {
+					if listener.matchPort {
 						vss = serviceMatchingListenerPort(s, listener)
 					} else {
 						vss = serviceMatchingVirtualServicePorts(s, ports)
@@ -415,7 +450,7 @@ func initSidecarScopeInternalIndexes(ps *PushContext, sidecarScope *SidecarScope
 						// Pick first namespace alphabetically
 						// This won't overwrite hostnames that have already been found eg because they were requested in hosts
 						var vss *Service
-						if matchPort {
+						if listener.matchPort {
 							vss = serviceMatchingListenerPort(byNamespace[ns[0]], listener)
 						} else {
 							vss = serviceMatchingVirtualServicePorts(byNamespace[ns[0]], ports)
@@ -436,6 +471,17 @@ func initSidecarScopeInternalIndexes(ps *PushContext, sidecarScope *SidecarScope
 	sidecarScope.destinationRules = make(map[host.Name][]*ConsolidatedDestRule)
 	sidecarScope.destinationRulesByNames = make(map[types.NamespacedName]*config.Config)
 	for _, s := range sidecarScope.services {
+		// In some scenarios, there may be multiple Services defined for the same hostname due to ServiceEntry allowing
+		// arbitrary hostnames. In these cases, we want to pick the first Service, which is the oldest. This ensures
+		// newly created Services cannot take ownership unexpectedly.
+		// However, the Service is from Kubernetes it should take precedence over ones not. This prevents someone from
+		// "domain squatting" on the hostname before a Kubernetes Service is created.
+		if existing, f := sidecarScope.servicesByHostname[s.Hostname]; f &&
+			!(existing.Attributes.ServiceRegistry != provider.Kubernetes && s.Attributes.ServiceRegistry == provider.Kubernetes) {
+			log.Debugf("Service %s/%s from registry %s ignored by %s/%s/%s", s.Attributes.Namespace, s.Hostname, s.Attributes.ServiceRegistry,
+				existing.Attributes.ServiceRegistry, existing.Attributes.Namespace, existing.Hostname)
+			continue
+		}
 		sidecarScope.servicesByHostname[s.Hostname] = s
 		drList := ps.destinationRule(configNamespace, s)
 		if drList != nil {
@@ -470,6 +516,7 @@ func convertIstioListenerToWrapper(ps *PushContext, configNamespace string,
 ) *IstioEgressListenerWrapper {
 	out := &IstioEgressListenerWrapper{
 		IstioListener: istioListener,
+		matchPort:     needsPortMatch(istioListener),
 	}
 
 	hostsByNamespace := make(map[string]hostClassification)
@@ -504,6 +551,8 @@ func convertIstioListenerToWrapper(ps *PushContext, configNamespace string,
 	out.virtualServices = SelectVirtualServices(ps.virtualServiceIndex, configNamespace, hostsByNamespace)
 	svces := ps.servicesExportedToNamespace(configNamespace)
 	out.services = out.selectServices(svces, configNamespace, hostsByNamespace)
+	out.mostSpecificWildcardVsIndex = computeWildcardHostVirtualServiceIndex(out.virtualServices, out.services)
+
 	return out
 }
 
@@ -554,6 +603,26 @@ func (sc *SidecarScope) HasIngressListener() bool {
 	return true
 }
 
+// InboundConnectionPoolForPort returns the connection pool settings for a specific inbound port. If there's not a
+// setting for that specific port, then the settings at the Sidecar resource are returned. If neither exist,
+// then nil is returned so the caller can decide what values to fall back on.
+func (sc *SidecarScope) InboundConnectionPoolForPort(port int) *networking.ConnectionPoolSettings {
+	if sc == nil || sc.Sidecar == nil {
+		return nil
+	}
+
+	for _, in := range sc.Sidecar.Ingress {
+		if int(in.Port.Number) == port {
+			if in.GetConnectionPool() != nil {
+				return in.ConnectionPool
+			}
+		}
+	}
+
+	// if set, it'll be non-nil and have values (guaranteed by validation); or if unset it'll be nil
+	return sc.Sidecar.GetInboundConnectionPool()
+}
+
 // Services returns the list of services imported by this egress listener
 func (ilw *IstioEgressListenerWrapper) Services() []*Service {
 	return ilw.services
@@ -563,6 +632,12 @@ func (ilw *IstioEgressListenerWrapper) Services() []*Service {
 // egress listener
 func (ilw *IstioEgressListenerWrapper) VirtualServices() []config.Config {
 	return ilw.virtualServices
+}
+
+// WildcardHostVirtualServiceIndex returns the the wildcardHostVirtualServiceIndex for this egress
+// listener.
+func (ilw *IstioEgressListenerWrapper) MostSpecificWildcardServiceIndex() map[host.Name]types.NamespacedName {
+	return ilw.mostSpecificWildcardVsIndex
 }
 
 // DependsOnConfig determines if the proxy depends on the given config.
@@ -694,19 +769,21 @@ func (ilw *IstioEgressListenerWrapper) selectServices(services []*Service, confi
 
 		// Check if there is an explicit import of form ns/* or ns/host
 		if importedHosts, nsFound := hostsByNamespace[configNamespace]; nsFound {
-			if svc := matchingService(importedHosts, s, ilw); svc != nil {
+			if svc := matchingAliasService(importedHosts, matchingService(importedHosts, s, ilw)); svc != nil {
 				importedServices = append(importedServices, svc)
 				continue
 			}
 		}
-		if wnsFound { // Check if there is an import of form */host or */*
-			if svc := matchingService(wildcardHosts, s, ilw); svc != nil {
+
+		// Check if there is an import of form */host or */*
+		if wnsFound {
+			if svc := matchingAliasService(wildcardHosts, matchingService(wildcardHosts, s, ilw)); svc != nil {
 				importedServices = append(importedServices, svc)
 			}
 		}
 	}
 
-	validServices := make(map[host.Name]string)
+	validServices := make(map[host.Name]string, len(importedServices))
 	for _, svc := range importedServices {
 		_, f := validServices[svc.Hostname]
 		// Select a single namespace for a given hostname.
@@ -717,39 +794,41 @@ func (ilw *IstioEgressListenerWrapper) selectServices(services []*Service, confi
 		}
 	}
 
-	filteredServices := make([]*Service, 0)
 	// Filter down to just instances in scope for the service
-	for _, svc := range importedServices {
-		if validServices[svc.Hostname] == svc.Attributes.Namespace {
-			filteredServices = append(filteredServices, svc)
-		}
-	}
-	return filteredServices
+	return slices.FilterInPlace(importedServices, func(svc *Service) bool {
+		return validServices[svc.Hostname] == svc.Attributes.Namespace
+	})
 }
 
 // Return the original service or a trimmed service which has a subset of the ports in original service.
 func matchingService(importedHosts hostClassification, service *Service, ilw *IstioEgressListenerWrapper) *Service {
-	matchPort := needsPortMatch(ilw)
-
-	// first, check exactHosts
-	if importedHosts.exactHosts.Contains(service.Hostname) {
-		if matchPort {
+	if importedHosts.Matches(service.Hostname) {
+		if ilw.matchPort {
 			return serviceMatchingListenerPort(service, ilw)
 		}
 		return service
 	}
+	return nil
+}
 
-	// exactHosts not found, fallback to loop allHosts
-	for _, importedHost := range importedHosts.allHosts {
-		// Check if the hostnames match per usual hostname matching rules
-		if service.Hostname.SubsetOf(importedHost) {
-			if matchPort {
-				return serviceMatchingListenerPort(service, ilw)
-			}
-			return service
+// matchingAliasService the original service or a trimmed service which has a subset of aliases, based on imports from sidecar
+func matchingAliasService(importedHosts hostClassification, service *Service) *Service {
+	if service == nil {
+		return nil
+	}
+	matched := make([]NamespacedHostname, 0, len(service.Attributes.Aliases))
+	for _, alias := range service.Attributes.Aliases {
+		if importedHosts.Matches(alias.Hostname) {
+			matched = append(matched, alias)
 		}
 	}
-	return nil
+
+	if len(matched) == len(service.Attributes.Aliases) {
+		return service
+	}
+	service = service.DeepCopy()
+	service.Attributes.Aliases = matched
+	return service
 }
 
 // serviceMatchingListenerPort constructs service with listener port.
@@ -798,9 +877,59 @@ func serviceMatchingVirtualServicePorts(service *Service, vsDestPorts sets.Set[i
 	return nil
 }
 
-func needsPortMatch(ilw *IstioEgressListenerWrapper) bool {
+// computeWildcardHostVirtualServiceIndex computes the wildcardHostVirtualServiceIndex for a given
+// list of virtualServices. This is used to optimize the lookup of the most specific wildcard host
+func computeWildcardHostVirtualServiceIndex(virtualServices []config.Config, services []*Service) map[host.Name]types.NamespacedName {
+	fqdnVirtualServiceHostIndex := make(map[host.Name]config.Config, len(virtualServices))
+	wildcardVirtualServiceHostIndex := make(map[host.Name]config.Config, len(virtualServices))
+	for _, vs := range virtualServices {
+		v := vs.Spec.(*networking.VirtualService)
+		for _, h := range v.Hosts {
+			// We may have duplicate (not just overlapping) hosts; in the case of exact duplicates, take the oldest one first
+			if host.Name(h).IsWildCarded() {
+				existingVs, exists := wildcardVirtualServiceHostIndex[host.Name(h)]
+				if !exists {
+					wildcardVirtualServiceHostIndex[host.Name(h)] = vs
+					continue
+				}
+				// Only replace if this VS is older than the existing one for this hostname
+				if vs.GetCreationTimestamp().Before(existingVs.GetCreationTimestamp()) {
+					wildcardVirtualServiceHostIndex[host.Name(h)] = vs
+				}
+			} else {
+				existingVs, exists := fqdnVirtualServiceHostIndex[host.Name(h)]
+				if !exists {
+					fqdnVirtualServiceHostIndex[host.Name(h)] = vs
+					continue
+				}
+				// Only replace if this VS is older than the existing one for this hostname
+				if vs.GetCreationTimestamp().Before(existingVs.GetCreationTimestamp()) {
+					fqdnVirtualServiceHostIndex[host.Name(h)] = vs
+				}
+			}
+		}
+	}
+
+	mostSpecificWildcardVsIndex := make(map[host.Name]types.NamespacedName)
+	comparator := MostSpecificHostMatch[config.Config]
+	if features.PersistOldestWinsHeuristicForVirtualServiceHostMatching {
+		comparator = OldestMatchingHost
+	}
+	for _, svc := range services {
+		_, ref, exists := comparator(svc.Hostname, fqdnVirtualServiceHostIndex, wildcardVirtualServiceHostIndex)
+		if !exists {
+			// This svc doesn't have a virtualService; skip
+			continue
+		}
+		mostSpecificWildcardVsIndex[svc.Hostname] = ref.NamespacedName()
+	}
+
+	return mostSpecificWildcardVsIndex
+}
+
+func needsPortMatch(l *networking.IstioEgressListener) bool {
 	// If a listener is defined with a port, we should match services with port except in the following case.
 	//  - If Port's protocol is proxy protocol(HTTP_PROXY) in which case the egress listener is used as generic egress http proxy.
-	return ilw.IstioListener != nil && ilw.IstioListener.Port.GetNumber() != 0 &&
-		protocol.Parse(ilw.IstioListener.Port.Protocol) != protocol.HTTP_PROXY
+	return l != nil && l.Port.GetNumber() != 0 &&
+		protocol.Parse(l.Port.Protocol) != protocol.HTTP_PROXY
 }

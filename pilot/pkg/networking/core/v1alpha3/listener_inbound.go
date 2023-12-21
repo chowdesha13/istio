@@ -24,7 +24,6 @@ import (
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	envoytype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"google.golang.org/protobuf/types/known/anypb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	extensions "istio.io/api/extensions/v1alpha1"
@@ -33,6 +32,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/extension"
+	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/security/authn"
@@ -146,10 +146,6 @@ func (lb *ListenerBuilder) buildInboundHBONEListeners() []*listener.Listener {
 
 			ClusterSpecifier: &route.RouteAction_Cluster{Cluster: MainInternalName},
 		}},
-		TypedPerFilterConfig: map[string]*anypb.Any{
-			// Note the difference with the waypoint below in the connect authority filter config.
-			xdsfilters.ConnectAuthorityFilter.Name: xdsfilters.ConnectAuthorityEnabledSidecar,
-		},
 	}}
 	terminate := lb.buildConnectTerminateListener(routes)
 	// Now we have top level listener... but we must have an internal listener for each standard filter chain
@@ -161,6 +157,9 @@ func (lb *ListenerBuilder) buildInboundHBONEListeners() []*listener.Listener {
 		ContinueOnListenerFiltersTimeout: true,
 	}
 
+	// Flush authz cache since we need filter state for the principal.
+	oldBuilder := lb.authzBuilder
+	lb.authzBuilder = authz.NewBuilder(authz.Local, lb.push, lb.node, true)
 	inboundChainConfigs := lb.buildInboundChainConfigs()
 	for _, cc := range inboundChainConfigs {
 		cc.hbone = true
@@ -178,6 +177,7 @@ func (lb *ListenerBuilder) buildInboundHBONEListeners() []*listener.Listener {
 		}
 		l.FilterChains = append(l.FilterChains, chains...)
 	}
+	lb.authzBuilder = oldBuilder
 	accessLogBuilder.setListenerAccessLog(lb.push, lb.node, l, istionetworking.ListenerClassSidecarInbound)
 	l.ListenerFilters = append(l.ListenerFilters, xdsfilters.OriginalDestination)
 	// TODO: Exclude inspectors from some inbound ports.
@@ -324,9 +324,8 @@ func getSidecarIngressPortList(node *model.Proxy) sets.Set[int] {
 	return ingressPortListSet
 }
 
-func (lb *ListenerBuilder) getFilterChainsByServicePort(chainsByPort map[uint32]inboundChainConfig,
-	enableSidecarServiceInboundListenerMerge bool,
-) map[uint32]inboundChainConfig {
+func (lb *ListenerBuilder) getFilterChainsByServicePort(enableSidecarServiceInboundListenerMerge bool) map[uint32]inboundChainConfig {
+	chainsByPort := make(map[uint32]inboundChainConfig)
 	ingressPortListSet := sets.New[int]()
 	sidecarScope := lb.node.SidecarScope
 	if sidecarScope.HasIngressListener() {
@@ -388,7 +387,7 @@ func (lb *ListenerBuilder) getFilterChainsByServicePort(chainsByPort map[uint32]
 
 // buildInboundChainConfigs builds all the application chain configs.
 func (lb *ListenerBuilder) buildInboundChainConfigs() []inboundChainConfig {
-	chainsByPort := make(map[uint32]inboundChainConfig)
+	var chainsByPort map[uint32]inboundChainConfig
 	// No user supplied sidecar scope or the user supplied one has no ingress listeners.
 	if !lb.node.SidecarScope.HasIngressListener() {
 
@@ -398,11 +397,13 @@ func (lb *ListenerBuilder) buildInboundChainConfigs() []inboundChainConfig {
 		if lb.node.GetInterceptionMode() == model.InterceptionNone {
 			return nil
 		}
-		chainsByPort = lb.getFilterChainsByServicePort(chainsByPort, false)
+		chainsByPort = lb.getFilterChainsByServicePort(false)
 	} else {
 		// only allow to merge inbound listeners if sidecar has ingress listener pilot has env EnableSidecarServiceInboundListenerMerge set
 		if features.EnableSidecarServiceInboundListenerMerge {
-			chainsByPort = lb.getFilterChainsByServicePort(chainsByPort, true)
+			chainsByPort = lb.getFilterChainsByServicePort(true)
+		} else {
+			chainsByPort = make(map[uint32]inboundChainConfig)
 		}
 
 		for _, i := range lb.node.SidecarScope.Sidecar.Ingress {
@@ -729,7 +730,7 @@ func buildInboundPassthroughChains(lb *ListenerBuilder) []*listener.FilterChain 
 // This avoids a possible loop where traffic sent to this port would continually call itself indefinitely.
 func buildInboundBlackhole(lb *ListenerBuilder) *listener.FilterChain {
 	var filters []*listener.Filter
-	if !lb.node.IsAmbient() {
+	if !lb.node.IsWaypointProxy() {
 		filters = append(filters, buildMetadataExchangeNetworkFilters()...)
 	}
 	filters = append(filters, buildMetricsNetworkFilters(lb.push, lb.node, istionetworking.ListenerClassSidecarInbound)...)
@@ -807,9 +808,6 @@ func (lb *ListenerBuilder) buildInboundNetworkFiltersForHTTP(cc inboundChainConf
 
 	// Authn
 	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHN)
-	if !cc.hbone {
-		filters = append(filters, xdsfilters.IstioNetworkAuthenticationFilter)
-	}
 
 	// Authz. Since this is HTTP, we only add WASM network filters -- not TCP RBAC, stats, etc.
 	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHZ)

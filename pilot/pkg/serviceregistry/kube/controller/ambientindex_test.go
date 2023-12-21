@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
 	k8sbeta "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
@@ -970,6 +971,24 @@ func TestEmptyVIPsExcluded(t *testing.T) {
 	assert.Equal(t, 0, len(vips), "optional IP fields should be ignored if empty")
 }
 
+// This is a regression test for a case where policies added after pods were not applied when
+// querying by service
+func TestPolicyAfterPod(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientControllers, true)
+	s := newAmbientTestServer(t, testC, testNW)
+
+	s.addService(t, "svc1",
+		map[string]string{},
+		map[string]string{},
+		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1")
+	s.assertEvent(t, s.svcXdsName("svc1"))
+	s.addPods(t, "127.0.0.1", "pod1", "sa1", map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
+	s.assertEvent(t, s.podXdsName("pod1"))
+	s.addPolicy(t, "selector", testNS, map[string]string{"app": "a"}, gvk.AuthorizationPolicy, nil)
+	s.assertEvent(t, s.podXdsName("pod1"))
+	assert.Equal(t, s.lookup(s.svcXdsName("svc1"))[1].GetWorkload().GetAuthorizationPolicies(), []string{"ns1/selector"})
+}
+
 type ambientTestServer struct {
 	cfg        *memory.Controller
 	controller *FakeController
@@ -977,6 +996,7 @@ type ambientTestServer struct {
 	pc         clienttest.TestClient[*corev1.Pod]
 	sc         clienttest.TestClient[*corev1.Service]
 	grc        clienttest.TestClient[*k8sbeta.Gateway]
+	t          *testing.T
 }
 
 func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.ID) *ambientTestServer {
@@ -985,8 +1005,10 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 		CRDs:             []schema.GroupVersionResource{gvr.KubernetesGateway},
 		ConfigController: cfg,
 		MeshWatcher:      mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: systemNS}),
+		NetworksWatcher:  mesh.NewFixedNetworksWatcher(nil),
 		ClusterID:        clusterID,
 		ConfigCluster:    true,
+		SystemNamespace:  systemNS,
 	})
 	controller.network = networkID
 	pc := clienttest.Wrap(t, controller.podsClient)
@@ -998,6 +1020,7 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 	go cfg.Run(test.NewStop(t))
 
 	return &ambientTestServer{
+		t:          t,
 		cfg:        cfg,
 		controller: controller,
 		fx:         fx,
@@ -1010,7 +1033,7 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 func (s *ambientTestServer) addWaypoint(t *testing.T, ip, name, sa string, ready bool) {
 	t.Helper()
 
-	fromSame := k8sbeta.NamespacesFromSame
+	fromSame := k8sv1.NamespacesFromSame
 	gatewaySpec := k8sbeta.GatewaySpec{
 		GatewayClassName: constants.WaypointGatewayClassName,
 		Listeners: []k8sbeta.Listener{
@@ -1050,7 +1073,7 @@ func (s *ambientTestServer) addWaypoint(t *testing.T, ip, name, sa string, ready
 			// addresses:
 			// - type: IPAddress
 			//   value: 10.96.59.188
-			Addresses: []k8sbeta.GatewayStatusAddress{
+			Addresses: []k8sv1.GatewayStatusAddress{
 				{
 					Type:  &addrType,
 					Value: ip,
@@ -1141,14 +1164,14 @@ func (s *ambientTestServer) deleteWorkloadEntry(t *testing.T, name string) {
 	_ = s.cfg.Delete(gvk.WorkloadEntry, name, "ns1", nil)
 }
 
-func (s *ambientTestServer) addServiceEntry(t *testing.T, hostStr string, addresses []string, name, ns string, labels map[string]string, inlined bool) {
+func (s *ambientTestServer) addServiceEntry(t *testing.T, hostStr string, addresses []string, name, ns string, labels map[string]string, epAddresses []string) {
 	t.Helper()
 
 	_, _ = s.controller.client.Kube().CoreV1().Namespaces().Create(context.Background(), &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"istio.io/dataplane-mode": "ambient"}},
 	}, metav1.CreateOptions{})
 
-	serviceEntry := generateServiceEntry(hostStr, addresses, labels, inlined)
+	serviceEntry := generateServiceEntry(hostStr, addresses, labels, epAddresses)
 	w := config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.ServiceEntry,
@@ -1167,23 +1190,24 @@ func (s *ambientTestServer) addServiceEntry(t *testing.T, hostStr string, addres
 	}
 }
 
-func generateServiceEntry(host string, addresses []string, labels map[string]string, inlined bool) *v1alpha3.ServiceEntry {
+func generateServiceEntry(host string, addresses []string, labels map[string]string, epAddresses []string) *v1alpha3.ServiceEntry {
 	var endpoints []*v1alpha3.WorkloadEntry
 	var workloadSelector *v1alpha3.WorkloadSelector
 
-	if !inlined {
+	if epAddresses == nil {
 		workloadSelector = &v1alpha3.WorkloadSelector{
 			Labels: labels,
 		}
 	} else {
-		endpoints = []*v1alpha3.WorkloadEntry{
-			{
-				Address: "127.0.0.1",
+		endpoints = []*v1alpha3.WorkloadEntry{}
+		for _, addr := range epAddresses {
+			endpoints = append(endpoints, &v1alpha3.WorkloadEntry{
+				Address: addr,
 				Labels:  labels,
 				Ports: map[string]uint32{
 					"http": 8081, // we will override the SE http port
 				},
-			},
+			})
 		}
 	}
 
@@ -1320,7 +1344,57 @@ func (s *ambientTestServer) addService(t *testing.T, name string, labels, annota
 	s.sc.CreateOrUpdate(service)
 }
 
+// assertIndexConsistency ensures that all indexes store the same data across the different indexes.
+func (s *ambientTestServer) assertIndexConsistency(t test.Failer) {
+	a := s.controller.ambientIndex.(*AmbientIndexImpl)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	// UID -> workload
+	workloads := map[string]*model.WorkloadInfo{}
+	addWorkload := func(w *model.WorkloadInfo) {
+		e, f := workloads[w.ResourceName()]
+		if !f {
+			workloads[w.ResourceName()] = w
+			return
+		}
+		// Already exists, make sure its identical
+		assert.Equal(t, e, w, "found inconsistency in workloads")
+	}
+	for _, w := range a.byUID {
+		addWorkload(w)
+	}
+	for _, w := range a.byPod {
+		addWorkload(w)
+	}
+	for _, w := range a.byWorkloadEntry {
+		addWorkload(w)
+	}
+	for _, m := range a.byService {
+		for _, w := range m {
+			addWorkload(w)
+		}
+	}
+
+	services := map[string]*model.ServiceInfo{}
+	addServices := func(w *model.ServiceInfo) {
+		e, f := services[w.ResourceName()]
+		if !f {
+			services[w.ResourceName()] = w
+			return
+		}
+		// Already exists, make sure its identical
+		assert.Equal(t, e, w, "found inconsistency in services")
+	}
+	for _, s := range a.serviceByAddr {
+		addServices(s)
+	}
+	for _, s := range a.serviceByNamespacedHostname {
+		addServices(s)
+	}
+}
+
 func (s *ambientTestServer) lookup(key string) []*model.AddressInfo {
+	s.assertIndexConsistency(s.t)
 	if key == "" {
 		return s.controller.ambientIndex.All()
 	}
