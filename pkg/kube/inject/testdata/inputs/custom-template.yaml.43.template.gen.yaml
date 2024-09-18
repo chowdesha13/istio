@@ -488,7 +488,7 @@ templates:
       {{- if eq .Values.global.pilotCertProvider "istiod" }}
       - name: istiod-ca-cert
         configMap:
-          name: istio-ca-root-cert
+          name: {{ (.Values.experimental).caRootCertConfigMap | default "istio-ca-root-cert" }}
       {{- end }}
       {{- if .Values.global.mountMtlsCerts }}
       # Use the key and cert mounted to /etc/certs/ for the in-cluster mTLS communications.
@@ -751,7 +751,7 @@ templates:
       {{- if eq .Values.global.pilotCertProvider "istiod" }}
       - name: istiod-ca-cert
         configMap:
-          name: istio-ca-root-cert
+          name: {{ (.Values.experimental).caRootCertConfigMap | default "istio-ca-root-cert" }}
       {{- end }}
       {{- if .Values.global.mountMtlsCerts }}
       # Use the key and cert mounted to /etc/certs/ for the in-cluster mTLS communications.
@@ -1122,7 +1122,7 @@ templates:
       {{- if eq .Values.global.pilotCertProvider "istiod" }}
       - name: istiod-ca-cert
         configMap:
-          name: istio-ca-root-cert
+          name: {{ (.Values.experimental).caRootCertConfigMap | default "istio-ca-root-cert" }}
       {{- end }}
       {{- if .Values.global.mountMtlsCerts }}
       # Use the key and cert mounted to /etc/certs/ for the in-cluster mTLS communications.
@@ -1435,7 +1435,7 @@ templates:
                   expirationSeconds: 43200
                   path: istio-token
           - configMap:
-              name: istio-ca-root-cert
+              name: {{ (.Values.experimental).caRootCertConfigMap | default "istio-ca-root-cert" }}
             name: istiod-ca-cert
           {{- if .Values.global.imagePullSecrets }}
           imagePullSecrets:
@@ -1788,7 +1788,7 @@ templates:
           {{- if eq .Values.global.pilotCertProvider "istiod" }}
           - name: istiod-ca-cert
             configMap:
-              name: istio-ca-root-cert
+              name: {{ (.Values.experimental).caRootCertConfigMap | default "istio-ca-root-cert" }}
           {{- end }}
           {{- if .Values.global.imagePullSecrets }}
           imagePullSecrets:
