@@ -145,6 +145,7 @@ func toMeshConfigProxyConfig(pc *v1beta1.ProxyConfig) *meshconfig.ProxyConfig {
 	if pc.Image != nil {
 		mcpc.Image = pc.Image
 	}
+	mcpc.PreserveCase = pc.PreserveCase
 	return mcpc
 }
 
