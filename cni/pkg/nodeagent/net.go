@@ -63,6 +63,7 @@ func (s *NetServer) ConstructInitialSnapshot(existingAmbientPods []*corev1.Pod) 
 	}
 
 	if s.podIptables.ReconcileModeEnabled() {
+		log.Debug("inpod reconcile mode enabled")
 		for _, pod := range existingAmbientPods {
 			log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
 			log.Debug("upgrading and reconciling inpod rules for already-running pod if necessary")
