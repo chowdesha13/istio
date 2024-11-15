@@ -378,7 +378,7 @@ func TestConstructInitialSnapReconcilesPodsIfIptConfiguratorSupportsReconciliati
 
 	fakeDeps := &dependencies.DependenciesStub{}
 
-	fixture := getTestFixureWithIptablesConfig(ctx, fakeDeps, nil, &podCfg)
+	fixture := getTestFixureWithIptablesConfig(ctx, fakeDeps, &podCfg, &podCfg)
 	netServer := fixture.netServer
 
 	podMeta := metav1.ObjectMeta{
@@ -411,7 +411,7 @@ func TestConstructInitialSnapDoesNotReconcilePodIfIptablesReconciliationDisabled
 
 	fakeDeps := &dependencies.DependenciesStub{}
 
-	fixture := getTestFixureWithIptablesConfig(ctx, fakeDeps, nil, &podCfg)
+	fixture := getTestFixureWithIptablesConfig(ctx, fakeDeps, &podCfg, &podCfg)
 	netServer := fixture.netServer
 
 	podMeta := metav1.ObjectMeta{
@@ -444,7 +444,7 @@ func TestReconcilePodReturnsErrorIfNoNetnsFound(t *testing.T) {
 
 	fakeDeps := &dependencies.DependenciesStub{}
 
-	fixture := getTestFixureWithIptablesConfig(ctx, fakeDeps, nil, &podCfg)
+	fixture := getTestFixureWithIptablesConfig(ctx, fakeDeps, &podCfg, &podCfg)
 	netServer := newNetServer(fixture.ztunnelServer, fixture.podNsMap, fixture.podIptablesConfigurator, &NoOpPodNetnsProcFinder{})
 
 	podMeta := metav1.ObjectMeta{
